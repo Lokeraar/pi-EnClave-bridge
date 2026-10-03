@@ -894,6 +894,21 @@ export interface DonorConfig {
   modelsJson: string;
   /** Provider key inside that file. */
   provider: string;
+  /**
+   * The donor is the SOURCE OF TRUTH (default). Its model-intrinsic values
+   * override the probe and the local curated layer for the same base model.
+   *
+   * This is a deliberate inversion of the usual precedence, and it has a real
+   * cost: where the two disagree, you publish the donor's claim instead of a
+   * value confirmed on this endpoint. Measured 2026-10-03, EnClave accepted all
+   * six effort levels for `glm-5.3-flash` where the donor claims only
+   * low/high/max — so in authority mode Pi stops offering `minimal` and
+   * `medium` for a model that would have taken them.
+   *
+   * Set false to restore "evidence first": the donor then only fills fields that
+   * have no evidence yet, and any successful probe wins.
+   */
+  authority: boolean;
 }
 
 export interface DonorIndex {
@@ -930,6 +945,7 @@ export function readDonorConfig(agentDir: string): DonorConfig {
     enabled: true,
     modelsJson: join(agentDir, "models.json"),
     provider: "opendesign",
+    authority: true,
   };
   try {
     const parsed = JSON.parse(readFileSync(join(agentDir, DONOR_FILE), "utf8")) as Partial<DonorConfig>;
@@ -937,6 +953,7 @@ export function readDonorConfig(agentDir: string): DonorConfig {
       enabled: parsed.enabled !== false,
       modelsJson: parsed.modelsJson ?? fallback.modelsJson,
       provider: parsed.provider ?? fallback.provider,
+      authority: parsed.authority !== false,
     };
   } catch {
     return fallback;
@@ -980,23 +997,29 @@ export function applyDonor(model: LiveModelConfig, donor: DonorIndex | undefined
   const entry = donor.byBareName.get(bareName(model.id));
   if (!entry) return { model, inherited: [] };
 
+  // In authority mode the donor's fields win outright; the label still records
+  // where the value came from, so a reader is never told it was measured here.
+  const authority = donor.config.authority;
+
   const next: LiveModelConfig = { ...model, provenance: { ...(model.provenance ?? ({} as ValueProvenance)) } };
   const inherited: string[] = [];
 
-  // `reasoning` is a plain boolean with no provenance slot, so it is only filled
-  // when the model is still on the conservative default and the donor is typed.
-  if (DONOR_FILL.reasoning.includes(model.provenance?.thinkingLevelMap ?? "vanilla")) {
-    if (typeof entry.reasoning === "boolean" && entry.reasoning !== model.reasoning) {
-      next.reasoning = entry.reasoning;
-      inherited.push("reasoning");
-    }
+  // `reasoning` is a plain boolean with no provenance slot, so it is only taken
+  // when the donor actually states it.
+  if (
+    typeof entry.reasoning === "boolean" &&
+    entry.reasoning !== model.reasoning &&
+    (authority || DONOR_FILL.reasoning.includes(model.provenance?.thinkingLevelMap ?? "vanilla"))
+  ) {
+    next.reasoning = entry.reasoning;
+    inherited.push("reasoning");
   }
 
   for (const field of ["thinkingLevelMap", "input"] as const) {
-    const allowed = DONOR_FILL[field];
     const current = (model.provenance?.[field] ?? "vanilla") as ValueOrigin;
-    if (!allowed.includes(current)) continue;
+    if (!authority && !DONOR_FILL[field].includes(current)) continue;
     const donorValue = entry[field];
+    // A donor with nothing to say is never allowed to blank a known value.
     if (donorValue === undefined || donorValue === null) continue;
     if (JSON.stringify(model[field]) === JSON.stringify(donorValue)) continue;
     (next as Record<string, unknown>)[field] = donorValue;
@@ -1315,6 +1338,7 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
     // Read once per refresh. A missing or unreadable donor is not an error:
     // `buildDonorIndex` yields an empty index and every fill is skipped.
     const donor = buildDonorIndex(readDonorConfig(options.agentDir));
+    const authority = donor.config.authority;
     const baseUrl = options.baseUrlOverride ?? fallbackBaseUrl;
     const storedModels = (ctx.stored?.models ?? []).filter(
       (m) => m && typeof m.id === "string" && (!m.provider || m.provider === PROVIDER_ID),
@@ -1337,7 +1361,7 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
       const merged = ids.map((id) => {
         const storedEntry = liveStored.find((m) => m.id === id);
         const base = normalize(curatedById.get(id) ?? (storedEntry as LiveModelConfig));
-        return curatedById.has(id) ? base : applyDonor(base, donor).model;
+        return curatedById.has(id) && !authority ? base : applyDonor(base, donor).model;
       });
       if (ctx.signal.aborted) return undefined;
       if (!sameModels(merged, storedModels)) {
@@ -1383,7 +1407,9 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
 
       const known = curatedById.get(listing.id);
       if (known) {
-        out.push(known); // curated values are never overwritten
+        // Curated normally outranks everything, but in donor AUTHORITY mode the
+        // donor is the source of truth and is applied last, to curated too.
+        out.push(authority ? applyDonor(known, donor).model : known);
         continue;
       }
       const previous = storedById.get(listing.id);
@@ -1411,11 +1437,11 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
       if (ctx.signal.aborted) return undefined;
       const known = curatedById.get(alias.id);
       if (known) {
-        out.push(known);
+        out.push(authority ? applyDonor(known, donor).model : known);
         continue;
       }
       const previous = storedById.get(alias.id);
-      out.push(previous ? normalize(previous) : aliasModel(alias, bounds));
+      out.push(previous ? applyDonor(normalize(previous), donor).model : aliasModel(alias, bounds));
     }
 
     const persisted = await ctx.publish({ persist: { models: out, checkedAt: Date.now() } });

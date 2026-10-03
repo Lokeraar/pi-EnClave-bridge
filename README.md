@@ -159,7 +159,12 @@ model-intrinsic values, indexed by **bare model name** (the id with any
 `<agentDir>/enclave-donor.json`:
 
 ```json
-{ "enabled": true, "modelsJson": "/path/to/models.json", "provider": "opendesign" }
+{
+  "enabled": true,
+  "modelsJson": "/path/to/models.json",
+  "provider": "opendesign",
+  "authority": true
+}
 ```
 
 **What may cross over:**
@@ -178,9 +183,40 @@ model-intrinsic values, indexed by **bare model name** (the id with any
 | `maxTokens` | **The trap.** OpenDesign reports `232000` for the DeepSeek family, but that is *amr-link's context budget*, not the model's ceiling. Copying it would assert EnClave lets you emit 232k — an unverified claim dressed as a measured one |
 | `cost` | The price is the gateway's, down to the cent |
 
-A donor only ever fills a field that has **no evidence yet**, and the origin it
-writes is `inherited` — never `curated` and never `measured` — so you can always
-tell which values were confirmed on this endpoint and which were carried in.
+### The donor is the source of truth
+
+By default (`authority: true`) the donor **overrides** the probe and the local
+curated layer for the same base model. Precedence for the inheritable fields:
+
+```
+donante  >  enclave-curated.json  >  medición del probe  >  store  >  gateway
+```
+
+This is a deliberate inversion, and it has a real cost. Where the two disagree,
+you publish the donor's claim instead of a value confirmed on this endpoint:
+
+| Model | was (measured here) | now (donor rules) |
+|---|---|---|
+| `glm-5.3-flash` | `mlmhxm` | `lhm` — Pi stops offering `minimal` and `medium` |
+| `deepseek-v4.1-flash` | `lhxm` | `mlmhxm` — Pi now offers `minimal` and `medium` |
+
+`deepseek-v4-pro` and `deepseek-v4-flash` are unaffected: donor and measurement
+agree there.
+
+To restore evidence-first behaviour, set it explicitly in
+`<agentDir>/enclave-donor.json`:
+
+```json
+{ "authority": false }
+```
+
+With `false`, the donor only fills fields that have no evidence yet and any
+successful probe wins. The measurements are not deleted either way — they stay
+in `<agentDir>/enclave-curated.json`.
+
+Whatever the mode, the origin written is `inherited` — never `curated` and
+never `measured` — so a reader can always tell which values were confirmed on
+this endpoint and which were carried in.
 
 ### Why it is a prior and not a truth
 
@@ -285,12 +321,13 @@ consecutive non-measurements, probing is abandoned for the rest of the refresh.
 node --experimental-strip-types scripts/test-bridge.mjs
 ```
 
-43 checks against a **mock** gateway: live membership, the routability filter,
+52 checks against a **mock** gateway: live membership, the routability filter,
 both retirement signals, ledger-blocked offline resurrection, the
 500-is-not-a-measurement rule, the tunnelled `502`/upstream-`400` rule, upstream
 `410` is not a rejection, measured vs gateway provenance, ceiling conservatism,
 curated precedence, and every donor rule including the `maxTokens` trap and the
-near-miss guard.
+near-miss guard, donor authority over a measurement, and the rule that a donor
+missing a field never blanks a known value.
 
 ## Endpoint state (measured 2026-10-03)
 

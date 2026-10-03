@@ -395,17 +395,58 @@ console.log("\n7. Donor layer (inherit from another provider, same base model)")
   );
   check("near-miss glm-5.3 does NOT inherit from glm-5.3-flash", near.model.provenance.thinkingLevelMap === "vanilla", near.model.provenance.thinkingLevelMap);
 
-  // measurement must not be overwritten
-  const measured = applyDonor(
+  // Default (authority) mode: the donor is the source of truth and DOES
+  // override a measurement. Non-authority mode is checked separately below.
+  const overMeasured = applyDonor(
     { ...gateway, provenance: { ...gateway.provenance, thinkingLevelMap: "measured" } },
     index,
   ).model;
-  check("a MEASURED value is never overwritten by a donor", measured.provenance.thinkingLevelMap === "measured");
+  check("default mode: the donor IS the source of truth over a measurement", overMeasured.provenance.thinkingLevelMap === "inherited", overMeasured.provenance.thinkingLevelMap);
 
   // disabled donor
   const off = buildDonorIndex({ enabled: false, modelsJson: join(donorDir, "models.json"), provider: "opendesign" });
   check("disabled donor yields an empty index", off.byBareName.size === 0);
   check("empty donor is a no-op", applyDonor(gateway, off).model === gateway);
+
+  // ---- authority mode: the donor is the source of truth ----
+  const authIdx = buildDonorIndex({ enabled: true, modelsJson: join(donorDir, "models.json"), provider: "opendesign", authority: true });
+  const measuredMap = { off: "none", minimal: null, low: "low", medium: null, high: "high", xhigh: "xhigh", max: "max" };
+  const measuredModel = {
+    ...gateway,
+    thinkingLevelMap: measuredMap,
+    provenance: { ...gateway.provenance, thinkingLevelMap: "measured" },
+  };
+  const auth = applyDonor(measuredModel, authIdx).model;
+  check("authority: donor overrides a MEASURED map", auth.thinkingLevelMap.off === "none" && auth.thinkingLevelMap.minimal === "minimal", JSON.stringify(auth.thinkingLevelMap));
+  check("authority: still labelled 'inherited', never 'measured'", auth.provenance.thinkingLevelMap === "inherited", auth.provenance.thinkingLevelMap);
+  check("authority: never invents maxTokens", auth.maxTokens === 16384, String(auth.maxTokens));
+  check("authority: never invents cost", auth.cost.input === 0.3, String(auth.cost.input));
+  check("authority: never overwrites contextWindow", auth.contextWindow === 1048576, String(auth.contextWindow));
+
+  // non-authority restores evidence-first
+  const evidIdx = buildDonorIndex({ enabled: true, modelsJson: join(donorDir, "models.json"), provider: "opendesign", authority: false });
+  const evid = applyDonor(measuredModel, evidIdx).model;
+  check("authority:false keeps the MEASURED map", evid.thinkingLevelMap === measuredMap, "donante pisó la medición");
+
+  // A donor that genuinely lacks a field must never blank a known value.
+  const sparseDir = mkdtempSync(join(tmpdir(), "enclave-sparse-"));
+  writeFileSync(
+    join(sparseDir, "models.json"),
+    JSON.stringify({ providers: { opendesign: { models: [{ id: "deepseek-v4.1-flash", reasoning: true }] } } }),
+  );
+  const sparseIdx = buildDonorIndex({ enabled: true, modelsJson: join(sparseDir, "models.json"), provider: "opendesign", authority: true });
+  const knownMap = { off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" };
+  const noMap = {
+    ...measuredModel,
+    thinkingLevelMap: knownMap,
+    input: ["text", "image"],
+    provenance: { ...measuredModel.provenance, thinkingLevelMap: "measured", input: "measured" },
+  };
+  const kept = applyDonor(noMap, sparseIdx).model;
+  check("authority: a donor missing a field never blanks a known value", JSON.stringify(kept.thinkingLevelMap) === JSON.stringify(knownMap), JSON.stringify(kept.thinkingLevelMap));
+  check("authority: a donor missing input never blanks it", JSON.stringify(kept.input) === '["text","image"]', JSON.stringify(kept.input));
+  check("authority: provenance of untouched fields stays 'measured'", kept.provenance.thinkingLevelMap === "measured", kept.provenance.thinkingLevelMap);
+  rmSync(sparseDir, { recursive: true, force: true });
 
   rmSync(donorDir, { recursive: true, force: true });
 }
