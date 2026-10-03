@@ -1535,7 +1535,15 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
     // ---- Phase 1: cache-only restore (runs on every runtime creation) ----
     if (!ctx.allowNetwork) {
       if (!storedModels.length) {
-        const baked = [...SNAPSHOT_MODELS, ...SNAPSHOT_ALIAS_MODELS].map((m) => normalize(m));
+        // The baked snapshot must clear the retirement ledger exactly like every
+        // other layer. Registering it filtered is not enough: this offline
+        // fallback is returned to Pi directly and is what the no-network path
+        // publishes, so an unfiltered copy here resurrects whatever was retired
+        // after the snapshot was taken.
+        const retiredNow = retiredIds(options.agentDir);
+        const baked = [...SNAPSHOT_MODELS, ...SNAPSHOT_ALIAS_MODELS]
+          .filter((m) => !retiredNow.has(m.id))
+          .map((m) => normalize(m));
         return baked.length ? baked : undefined;
       }
       // Ids a previous SUCCESSFUL live check found retired must not come back,

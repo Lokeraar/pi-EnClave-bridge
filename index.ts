@@ -35,12 +35,22 @@ import {
   ENCLAVE_BASE_URL,
   makeRefreshModels,
   PROVIDER_ID,
+  retiredIds,
   SNAPSHOT_ALIAS_MODELS,
   SNAPSHOT_MODELS,
 } from "./enclave-live.ts";
 
 export default async function (pi: ExtensionAPI) {
   const agentDir = getAgentDir();
+
+  // The baked snapshot is registered eagerly so startup resolves before any
+  // network call, but it is a transcription of one past observation. It MUST go
+  // through the retirement ledger like every other layer: without this, a model
+  // retired after the snapshot was taken stays selectable forever in the
+  // offline path, because nothing else filters the statically registered list.
+  const retired = retiredIds(agentDir);
+  const alive = (m: { id: string }) => !retired.has(m.id);
+  const models = [...SNAPSHOT_MODELS, ...SNAPSHOT_ALIAS_MODELS].filter(alive);
 
   // Registration is unconditional: this bridge owns the EnClave provider and
   // replaces whatever `models.json` declares for it. The baked snapshot is what
@@ -51,7 +61,7 @@ export default async function (pi: ExtensionAPI) {
     api: "openai-completions",
     baseUrl: ENCLAVE_BASE_URL,
     authHeader: true,
-    models: [...SNAPSHOT_MODELS, ...SNAPSHOT_ALIAS_MODELS],
+    models,
     refreshModels: makeRefreshModels({ agentDir, fallbackBaseUrl: ENCLAVE_BASE_URL }),
   });
 }

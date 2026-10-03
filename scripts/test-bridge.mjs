@@ -543,6 +543,20 @@ console.log("\n8. Upstream-gone needs repeated, time-separated evidence");
   check("refresh does NOT revive an upstream-gone retirement", after.retired["cyberouter/glm-5.3"]?.reason === "upstream-gone", JSON.stringify(after.retired));
   check("refresh DOES clear a gateway-asserted retirement", after.retired["cyberouter/deepseek-v4.1-flash"] === undefined, JSON.stringify(after.retired));
 
+  // The offline baked-snapshot fallback must clear the ledger too, or it
+  // resurrects whatever was retired after the snapshot was baked.
+  const snapDir = mkdtempSync(join(tmpdir(), "enclave-snap-"));
+  const { writeFileSync: wfs } = await import("node:fs");
+  wfs(
+    join(snapDir, "enclave-retired.json"),
+    JSON.stringify({ updatedAt: Date.now(), retired: { "cyberouter/glm-5.3": { at: Date.now(), reason: "upstream-gone" } } }, null, 2),
+  );
+  const refreshSnap = makeRefreshModels({ agentDir: snapDir });
+  const offlineBaked = await refreshSnap(makeCtx({ allowNetwork: false }).ctx);
+  check("offline baked snapshot respects the ledger", !offlineBaked.some((m) => m.id === "cyberouter/glm-5.3"), "fugó del snapshot");
+  check("offline baked snapshot still returns the rest", offlineBaked.length > 0, String(offlineBaked.length));
+  rmSync(snapDir, { recursive: true, force: true });
+
   rmSync(dir, { recursive: true, force: true });
 }
 
