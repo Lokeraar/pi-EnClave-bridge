@@ -1,0 +1,44 @@
+{
+  "name": "@lokeraar/pi-enclave-bridge",
+  "version": "0.1.0",
+  "description": "EnClave provider bridge for Pi: /login once and the live router catalog appears in /model with real context windows, real per-token prices, live membership and the router's task aliases — auto-synced from the endpoint.",
+  "type": "module",
+  "main": "./index.ts",
+  "files": [
+    "*.ts",
+    "scripts/*.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "keywords": [
+    "pi",
+    "pi-package",
+    "pi-extension",
+    "provider",
+    "ai",
+    "ai-provider",
+    "llm",
+    "enclave",
+    "enclave-ai",
+    "openai-compatible",
+    "openrouter-compatible",
+    "model-catalog",
+    "model-sync",
+    "ai-model",
+    "llm-router"
+  ],
+  "author": "Lokeraar",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lokeraar/pi-EnClave-bridge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Lokeraar/pi-EnClave-bridge/issues"
+  }
+}
