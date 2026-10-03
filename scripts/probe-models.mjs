@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
 const {
+  sweepUpstreamGone,
   probeNewModel,
   fetchLiveCatalog,
   gatewayModel,
@@ -75,6 +76,12 @@ if (flag("--help")) {
 const agentDir = opt("--agent-dir", join(homedir(), ".pi", "agent"));
 const asJson = flag("--json");
 const doProbe = flag("--all");
+const doRetire = flag("--retire-upstream");
+
+if (argv.length && !doRetire && !asJson) {
+  console.error("unknown flag");
+  process.exit(2);
+}
 
 // ---------------------------------------------------------------- credential
 function readModelsJson(dir) {
@@ -168,6 +175,40 @@ const aliasRows = catalog.aliases.map((alias) => ({
   alias,
   built: curatedById.get(alias.id) ?? aliasModel(alias, bounds),
 }));
+
+// ---------------------------------------------------------------- upstream-gone sweep
+if (doRetire) {
+  const sweep = await sweepUpstreamGone({
+    agentDir,
+    baseUrl,
+    key,
+    signal,
+    catalog,
+  });
+  if (asJson) {
+    console.log(JSON.stringify({ ...sweep, retiredIds: [...retiredIds(agentDir)] }, null, 2));
+  } else {
+    console.log(`\nUpstream-gone sweep — ${sweep.checkedAt}`);
+    console.log(`${sweep.healthy} healthy, ${sweep.gone.length} upstream-gone\n`);
+    for (const g of sweep.gone) {
+      console.log(
+        `  ${g.retired ? "RETIRED" : "pending "}  ${g.id.replace(/^cyberouter\//, "")}  (${g.sightings} sighting(s))`,
+      );
+    }
+    if (sweep.revived.length) {
+      console.log(`\n  revived since last sweep: ${sweep.revived.join(", ")}`);
+    }
+    const pending = sweep.gone.filter((g) => !g.retired);
+    if (pending.length) {
+      console.log(
+        `\n  A sighting is not a retirement. Re-run after a few minutes to confirm:\n` +
+          `    node --experimental-strip-types scripts/probe-models.mjs --retire-upstream`,
+      );
+    }
+  }
+  console.log("");
+  process.exit(0);
+}
 
 // ---------------------------------------------------------------- output
 if (asJson) {

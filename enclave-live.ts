@@ -934,6 +934,26 @@ const DONOR_FILL: Record<string, ValueOrigin[]> = {
   input: ["vanilla", "gateway"],
 };
 
+/**
+ * Numeric fields the donor now also owns in authority mode: `contextWindow` and
+ * `maxTokens`.
+ *
+ * They are accepted with a clamp — the donor may LOWER a value that already has
+ * evidence, never raise it above it. That direction matters. Adopted unchecked,
+ * a donor claiming a wider window than the endpoint serves would be a false
+ * claim published as truth; adopted clamped, the worst case is that Pi
+ * under-promises a model that could have done more, which costs capability and
+ * never correctness.
+ *
+ * Verified against the live endpoint on 2026-10-03: every donor value for these
+ * fields is LOWER than what EnClave actually allows, for all four matching
+ * models — so the clamp never binds today, and the donor's numbers stand.
+ *
+ * `cost` is still excluded: the donor has no price at all, so inheriting it
+ * would publish every model as free.
+ */
+const DONOR_NUMERIC_FIELDS = ["contextWindow", "maxTokens"] as const;
+
 function bareName(id: string): string {
   const i = id.lastIndexOf("/");
   return i === -1 ? id : id.slice(i + 1);
@@ -997,8 +1017,10 @@ export function applyDonor(model: LiveModelConfig, donor: DonorIndex | undefined
   const entry = donor.byBareName.get(bareName(model.id));
   if (!entry) return { model, inherited: [] };
 
-  // In authority mode the donor's fields win outright; the label still records
-  // where the value came from, so a reader is never told it was measured here.
+  // In authority mode the donor's fields win outright — except the numeric ones,
+  // which are clamped to the evidence we already hold (see DONOR_NUMERIC_FIELDS).
+  // The label still records where the value came from, so a reader is never told
+  // a carried-in value was measured here.
   const authority = donor.config.authority;
 
   const next: LiveModelConfig = { ...model, provenance: { ...(model.provenance ?? ({} as ValueProvenance)) } };
@@ -1013,6 +1035,22 @@ export function applyDonor(model: LiveModelConfig, donor: DonorIndex | undefined
   ) {
     next.reasoning = entry.reasoning;
     inherited.push("reasoning");
+  }
+
+  for (const field of DONOR_NUMERIC_FIELDS) {
+    const origin = (model.provenance?.[field] ?? "vanilla") as ValueOrigin;
+    if (!authority && origin !== "vanilla") continue;
+    const donorNumber = entry[field];
+    const currentNumber = model[field];
+    if (typeof donorNumber !== "number" || typeof currentNumber !== "number") continue;
+    // No evidence yet → the donor fills the gap outright, so a wider window is
+    // adopted. Evidence in hand → the donor may only LOWER it, never raise it
+    // above something already confirmed.
+    const value = origin === "vanilla" ? donorNumber : Math.min(donorNumber, currentNumber);
+    if (value === currentNumber) continue;
+    (next as Record<string, unknown>)[field] = value;
+    (next.provenance as Record<string, unknown>)[field] = "inherited";
+    inherited.push(field);
   }
 
   for (const field of ["thinkingLevelMap", "input"] as const) {
@@ -1036,12 +1074,24 @@ export function applyDonor(model: LiveModelConfig, donor: DonorIndex | undefined
 
 const RETIRED_FILE = "enclave-retired.json";
 
-export type RetirementReason = "not-listed" | "not-routable";
+export type RetirementReason = "not-listed" | "not-routable" | "upstream-gone";
 
 export interface RetiredLedger {
   updatedAt: number;
   /** id -> { at, reason } */
   retired: Record<string, { at: number; reason: RetirementReason }>;
+  /**
+   * Pending `upstream-gone` evidence, id -> sightings.
+   *
+   * This one is deliberately NOT acted on immediately. Unlike `not-listed` and
+   * `not-routable`, which are the gateway describing itself, `upstream-gone` is
+   * us reading an error body against the catalog's own "healthy" claim. A
+   * deployment can be pulled for maintenance and returned, and a proxy can
+   * mislabel a temporary condition as 410. So it takes a repeated sighting,
+   * separated in time, before it becomes a retirement — and the ledger is
+   * self-correcting, so the cost of being wrong is bounded to the window.
+   */
+  upstreamGone?: Record<string, { first: number; last: number; sightings: number }>;
 }
 
 function readRetiredLedger(agentDir: string): RetiredLedger {
@@ -1053,7 +1103,13 @@ function readRetiredLedger(agentDir: string): RetiredLedger {
   } catch {
     // Missing or corrupt → "nothing retired", so we never hide a model.
   }
-  return { updatedAt: 0, retired: {} };
+  return { updatedAt: 0, retired: {}, upstreamGone: {} };
+}
+
+function persistRetiredLedger(agentDir: string, retired: RetiredLedger["retired"], upstreamGone: RetiredLedger["upstreamGone"]): RetiredLedger {
+  const updated: RetiredLedger = { updatedAt: Date.now(), retired, upstreamGone };
+  writeRetiredLedger(agentDir, updated);
+  return updated;
 }
 
 function writeRetiredLedger(agentDir: string, ledger: RetiredLedger): void {
@@ -1087,7 +1143,16 @@ function reconcileRetired(
     ...catalog.aliases.map((a) => a.id),
   ]);
 
-  for (const id of Object.keys(next)) if (liveIds.has(id)) delete next[id];
+  // Clear a retirement ONLY when the reason is one the gateway asserts about
+  // itself. `upstream-gone` is our reading of an error body against the
+  // catalog's own "healthy" claim, so it is not this function's to clear —
+  // otherwise the next refresh would resurrect a model this same sweep retired,
+  // since the catalog still lists it as routable. Only the sweep revives those.
+  for (const id of Object.keys(next)) {
+    const reason = next[id]?.reason;
+    const gatewayAsserted = reason === "not-listed" || reason === "not-routable";
+    if (gatewayAsserted && liveIds.has(id)) delete next[id];
+  }
 
   for (const m of candidates) {
     if (liveIds.has(m.id)) continue;
@@ -1098,13 +1163,121 @@ function reconcileRetired(
   }
 
   if (JSON.stringify(next) === JSON.stringify(ledger.retired)) return ledger;
-  const updated: RetiredLedger = { updatedAt: now, retired: next };
-  writeRetiredLedger(agentDir, updated);
-  return updated;
+  return persistRetiredLedger(agentDir, next, ledger.upstreamGone);
 }
 
 export function retiredIds(agentDir: string): Set<string> {
   return new Set(Object.keys(readRetiredLedger(agentDir).retired));
+}
+
+// ---------------------------------------------------------------------------
+// Upstream-gone sweep — the one retirement signal we have to argue for
+// ---------------------------------------------------------------------------
+
+/** A model must be seen gone this many times before it is retired. */
+const UPSTREAM_GONE_SIGHTINGS = 2;
+/** ...and not sooner than this, so a blip cannot accumulate two strikes. */
+const UPSTREAM_GONE_CONFIRM_MS = 2 * 60_000;
+
+/**
+ * One cheap call to see whether a model answers at all. Returns the failure
+ * class, or `"ok"`. Cheaper than a full probe by an order of magnitude, which
+ * matters because the sweep visits every model.
+ */
+export async function checkLiveness(
+  baseUrl: string,
+  key: string,
+  modelId: string,
+  signal: AbortSignal,
+): Promise<FailureKind | "ok"> {
+  const r = await postChat(
+    baseUrl,
+    key,
+    { model: modelId, messages: [{ role: "user", content: "hi" }], max_tokens: 8 },
+    signal,
+    20_000,
+  );
+  return r.ok ? "ok" : classifyFailure(r.status, r.body);
+}
+
+export interface UpstreamGoneReport {
+  checkedAt: string;
+  gone: Array<{ id: string; sightings: number; retired: boolean }>;
+  revived: string[];
+  healthy: number;
+}
+
+/**
+ * Record an `upstream-gone` sighting per model and retire once the evidence
+ * repeats after a minimum delay.
+ *
+ * Never called from the refresh path. The catalog is the gateway's own
+ * statement about itself, and overriding it on the strength of an error body is
+ * a different class of decision than dropping an id it stopped listing — so this
+ * runs only from the deliberate audit.
+ */
+export async function sweepUpstreamGone(options: {
+  agentDir: string;
+  baseUrl: string;
+  key: string;
+  signal: AbortSignal;
+  catalog: LiveCatalog;
+}): Promise<UpstreamGoneReport> {
+  const { agentDir, baseUrl, key, signal, catalog } = options;
+  const ledger = readRetiredLedger(agentDir);
+  const now = Date.now();
+  const sightings = { ...(ledger.upstreamGone ?? {}) };
+  const retired = { ...ledger.retired };
+
+  const gone: UpstreamGoneReport["gone"] = [];
+  const revived: string[] = [];
+  let healthy = 0;
+
+  for (const listing of catalog.models) {
+    if (signal.aborted) break;
+    const kind = await checkLiveness(baseUrl, key, listing.id, signal);
+    if (signal.aborted) break;
+
+    if (kind === "ok" || kind === "no-route" || kind === "parameter") {
+      // Recovered, or a structural signal we already handle elsewhere.
+      if (sightings[listing.id]) {
+        delete sightings[listing.id];
+        if (!revived.includes(listing.id)) revived.push(listing.id);
+      }
+      if (kind === "ok") {
+        healthy++;
+        // Self-correcting: a model that answers again is un-retired. Scoped to
+        // `upstream-gone` on purpose — `not-listed` and `not-routable` are the
+        // gateway's own structural claims and are cleared by reconcileRetired,
+        // not by us overriding them from an error body.
+        if (retired[listing.id]?.reason === "upstream-gone") {
+          delete retired[listing.id];
+          if (!revived.includes(listing.id)) revived.push(listing.id);
+        }
+      }
+      continue;
+    }
+
+    if (kind !== "upstream-gone") continue;
+
+    const prior = sightings[listing.id];
+    const record = prior
+      ? { first: prior.first, last: now, sightings: prior.sightings + 1 }
+      : { first: now, last: now, sightings: 1 };
+    sightings[listing.id] = record;
+
+    const confirmed = record.sightings >= UPSTREAM_GONE_SIGHTINGS && now - record.first >= UPSTREAM_GONE_CONFIRM_MS;
+    if (confirmed && !retired[listing.id]) {
+      retired[listing.id] = { at: now, reason: "upstream-gone" };
+    }
+    gone.push({ id: listing.id, sightings: record.sightings, retired: Boolean(retired[listing.id]) });
+  }
+
+  const before = JSON.stringify([ledger.retired, ledger.upstreamGone ?? {}]);
+  const after = JSON.stringify([retired, sightings]);
+  if (before !== after) persistRetiredLedger(agentDir, retired, sightings);
+
+  return { checkedAt: new Date(now).toISOString(), gone, revived, healthy };
 }
 
 // ---------------------------------------------------------------------------
@@ -1213,6 +1386,21 @@ export async function runReprobeAudit(options: {
   catalog: LiveCatalog;
 }): Promise<ReprobeReport> {
   const { agentDir, baseUrl, key, signal, curated, catalog } = options;
+  // The audit is the deliberate act, so this is where the upstream-gone signal
+  // is allowed to act on the catalog's own "healthy" claim.
+  const sweep = await sweepUpstreamGone({ agentDir, baseUrl, key, signal, catalog });
+  if (signal.aborted) {
+    const empty: ReprobeReport = {
+      generatedAt: new Date().toISOString(),
+      baseUrl,
+      audited: catalog.models.length,
+      changed: [],
+      retired: [],
+      uncurated: [],
+      findings: [],
+    };
+    return empty;
+  }
   const ledger = readRetiredLedger(agentDir);
   const findings: ReprobeFinding[] = [];
   const retired = Object.entries(ledger.retired).map(([id, v]) => ({ id, reason: v.reason }));

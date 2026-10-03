@@ -81,14 +81,34 @@ Only the first is obvious, and the third is the one that will bite you.
    > Inference provider returned HTTP 410
 
    `410 Gone` is a permanent HTTP semantic, not a blip, and the gateway's own
-   catalog has not caught up. As of 2026-10-03: `cyberouter/kimi-k2.6`,
-   `cyberouter/inkling`, and the `cyberouter/remediation` alias (which routes to
-   a dead task).
+   catalog has not caught up. `cyberouter/kimi-k2.6` and `cyberouter/inkling`
+   were retired on this basis, after two sightings separated by more than two
+   minutes:
+
+   ```bash
+   node --experimental-strip-types scripts/probe-models.mjs --retire-upstream
+   ```
+
+   This signal never fires from the refresh path, only from that deliberate
+   sweep — see below for why the separation matters.
 
 States 1 and 2 are the gateway asserting structure, so they retire an id
-automatically. State 3 is the gateway being *wrong*, so it is **reported** by the
-CLI and the audit but does not retire anything on its own — a maintainer decides,
-because a transient upstream outage must not permanently drop a model.
+automatically and are cleared as soon as the gateway lists it again. State 3 is
+the gateway being *wrong*, so it is different in two ways:
+
+- It requires **two sightings separated by at least two minutes**. A deployment
+  can be pulled for maintenance and returned, and a proxy can mislabel a
+  temporary condition as `410`. One observation is a data point; two are
+  evidence.
+- It is **never cleared by the refresh path**. `reconcileRetired` only clears
+  retirements whose reason the gateway asserts about itself; otherwise the very
+  next refresh would resurrect the model, because the catalog still lists it as
+  routable. Only the sweep revives an `upstream-gone`, and only after the model
+  actually answers.
+
+Retiring those two models also repaired the `cyberouter/remediation` alias,
+which routes by `task_perf` and had been picking the highest-scoring
+remediation model — `kimi-k2.6` at 0.802 — which is one of the dead ones.
 
 Retirements live in `<agentDir>/enclave-retired.json` with the reason, and are
 enforced offline: a retired id is never restored from the store, so it cannot
@@ -174,14 +194,40 @@ model-intrinsic values, indexed by **bare model name** (the id with any
 | `reasoning` | ✅ | A vendor that rejects a value rejects it through every reseller |
 | `thinkingLevelMap` | ✅ | Same — it is the vendor's enum, not the router's |
 | `input` | ✅ | And it beats EnClave's `modality`, which is a templated fill |
+| `contextWindow` | ✅, clamped | The donor sets it; it may not exceed what the gateway declares |
+| `maxTokens` | ✅, clamped | The donor sets it; it may not exceed what we already have evidence for |
 
-**What never crosses over:**
+`cost` is the only field the donor never owns. It has no price at all, so
+inheriting it would publish every model as free.
 
-| Field | Why not |
-|---|---|
-| `contextWindow` | EnClave declares its own, and it is the gateway actually serving |
-| `maxTokens` | **The trap.** OpenDesign reports `232000` for the DeepSeek family, but that is *amr-link's context budget*, not the model's ceiling. Copying it would assert EnClave lets you emit 232k — an unverified claim dressed as a measured one |
-| `cost` | The price is the gateway's, down to the cent |
+### The clamp, and why the direction matters
+
+The donor's numbers are accepted **clamped to the evidence already in hand**: it
+may *lower* a value, never raise it above something already confirmed. A field
+with no evidence yet is filled outright, so a wider window is adopted there.
+
+The direction is the whole point. Adopted unchecked, a donor claiming a wider
+window than the endpoint serves would be a false claim published as truth.
+Adopted clamped, the worst case is that Pi under-promises a model that could
+have done more — which costs capability and never correctness.
+
+Verified against the live endpoint on 2026-10-03: **every** donor value for
+these fields is *lower* than what EnClave actually allows, for all four matching
+models. The clamp never binds, and the donor's numbers stand:
+
+| Model | ctx donor / real | max out donor / measured |
+|---|---|---|
+| `glm-5.3-flash` | 1 048 000 / 1 048 576 | 128 000 / 524 288 |
+| `deepseek-v4-pro` | 1 048 000 / 1 048 576 | 232 000 / 524 288 |
+| `deepseek-v4.1-flash` | 1 048 000 / 1 048 576 | 232 000 / 524 288 |
+| `deepseek-v4-flash` | 1 048 000 / 1 048 576 | 232 000 / 262 144 |
+
+What this costs: Pi will now cap output at 232k for the DeepSeek family where
+EnClave would have allowed 524k. That is a real loss of headroom, taken
+deliberately in exchange for a single source of truth. **A sighting is not a
+retirement**, and the reverse also holds — **a value is not a fact just because
+the donor says so**: the clamp still stands between the donor and any claim the
+endpoint has already contradicted.
 
 ### The donor is the source of truth
 
@@ -321,7 +367,7 @@ consecutive non-measurements, probing is abandoned for the rest of the refresh.
 node --experimental-strip-types scripts/test-bridge.mjs
 ```
 
-52 checks against a **mock** gateway: live membership, the routability filter,
+69 checks against a **mock** gateway: live membership, the routability filter,
 both retirement signals, ledger-blocked offline resurrection, the
 500-is-not-a-measurement rule, the tunnelled `502`/upstream-`400` rule, upstream
 `410` is not a rejection, measured vs gateway provenance, ceiling conservatism,

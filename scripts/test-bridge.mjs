@@ -380,18 +380,22 @@ console.log("\n7. Donor layer (inherit from another provider, same base model)")
     provenance: { contextWindow: "gateway", maxTokens: "vanilla", thinkingLevelMap: "vanilla", input: "gateway", cost: "gateway" },
   };
 
-  const r = applyDonor(gateway, index).model;
+  // explicit non-authority index for the fill-only semantics
+  const fillIdx = buildDonorIndex({ enabled: true, modelsJson: join(donorDir, "models.json"), provider: "opendesign", authority: false });
+  const r = applyDonor(gateway, fillIdx).model;
   check("thinkingLevelMap inherited", r.thinkingLevelMap.low === "low" && r.thinkingLevelMap.off === "none");
   check("input inherited over the templated gateway fill", JSON.stringify(r.input) === '["text","image"]', JSON.stringify(r.input));
   check("inherited fields are labelled 'inherited'", r.provenance.thinkingLevelMap === "inherited" && r.provenance.input === "inherited");
-  check("contextWindow NOT inherited (gateway-specific)", r.contextWindow === 1048576, String(r.contextWindow));
-  check("maxTokens NOT inherited (the 232000 trap)", r.maxTokens === 16384, String(r.maxTokens));
+  // In non-authority mode the donor fills gaps only, and never raises a value.
+  check("non-authority: the donor may not LOWER a gateway-declared context", r.contextWindow === 1048576, String(r.contextWindow));
+  check("non-authority: a vanilla maxTokens gap IS filled from the donor", r.maxTokens === 232000, String(r.maxTokens));
+  check("non-authority: a gateway-declared context is never touched", r.contextWindow === 1048576, String(r.contextWindow));
   check("cost NOT inherited", r.cost.input === 0.3, String(r.cost.input));
 
   // near-miss must not bleed
   const near = applyDonor(
     { ...gateway, id: "cyberouter/glm-5.3", provenance: { ...gateway.provenance } },
-    index,
+    fillIdx,
   );
   check("near-miss glm-5.3 does NOT inherit from glm-5.3-flash", near.model.provenance.thinkingLevelMap === "vanilla", near.model.provenance.thinkingLevelMap);
 
@@ -419,9 +423,10 @@ console.log("\n7. Donor layer (inherit from another provider, same base model)")
   const auth = applyDonor(measuredModel, authIdx).model;
   check("authority: donor overrides a MEASURED map", auth.thinkingLevelMap.off === "none" && auth.thinkingLevelMap.minimal === "minimal", JSON.stringify(auth.thinkingLevelMap));
   check("authority: still labelled 'inherited', never 'measured'", auth.provenance.thinkingLevelMap === "inherited", auth.provenance.thinkingLevelMap);
-  check("authority: never invents maxTokens", auth.maxTokens === 16384, String(auth.maxTokens));
+  check("authority: fills a vanilla maxTokens from the donor", auth.maxTokens === 232000, String(auth.maxTokens));
   check("authority: never invents cost", auth.cost.input === 0.3, String(auth.cost.input));
-  check("authority: never overwrites contextWindow", auth.contextWindow === 1048576, String(auth.contextWindow));
+  check("authority: donor may LOWER contextWindow", auth.contextWindow === 1048000, String(auth.contextWindow));
+  check("authority: a lowered contextWindow is labelled inherited", auth.provenance.contextWindow === "inherited", auth.provenance.contextWindow);
 
   // non-authority restores evidence-first
   const evidIdx = buildDonorIndex({ enabled: true, modelsJson: join(donorDir, "models.json"), provider: "opendesign", authority: false });
@@ -448,7 +453,97 @@ console.log("\n7. Donor layer (inherit from another provider, same base model)")
   check("authority: provenance of untouched fields stays 'measured'", kept.provenance.thinkingLevelMap === "measured", kept.provenance.thinkingLevelMap);
   rmSync(sparseDir, { recursive: true, force: true });
 
+  // ---- numeric fields: the donor may lower, never raise ----
+  const dir3 = mkdtempSync(join(tmpdir(), "enclave-lower-"));
+  writeFileSync(
+    join(dir3, "models.json"),
+    JSON.stringify({
+      providers: {
+        opendesign: {
+          models: [
+            { id: "deepseek-v4.1-flash", contextWindow: 1048000, maxTokens: 232000 },
+            { id: "deepseek-v4-pro", contextWindow: 4194304, maxTokens: 4194304 },
+          ],
+        },
+      },
+    }),
+  );
+  const lowIdx = buildDonorIndex({ enabled: true, modelsJson: join(dir3, "models.json"), provider: "opendesign", authority: true });
+  const lowered = applyDonor(
+    { ...measuredModel, contextWindow: 1048576, maxTokens: 524288,
+      provenance: { ...measuredModel.provenance, contextWindow: "gateway", maxTokens: "measured" } },
+    lowIdx,
+  ).model;
+  check("authority: a donor claiming LESS output wins", lowered.maxTokens === 232000, String(lowered.maxTokens));
+  check("authority: a donor claiming LESS context wins", lowered.contextWindow === 1048000, String(lowered.contextWindow));
+  check("authority: cost is still never inherited", lowered.cost.input === 0.3, String(lowered.cost.input));
+
+  const clamped = applyDonor(
+    { ...measuredModel, contextWindow: 262144, maxTokens: 65536,
+      provenance: { ...measuredModel.provenance, contextWindow: "gateway", maxTokens: "measured" } },
+    lowIdx,
+  ).model;
+  check("authority: a donor claiming MORE context is clamped down", clamped.contextWindow === 262144, String(clamped.contextWindow));
+  check("authority: a donor claiming MORE output is clamped down", clamped.maxTokens === 65536, String(clamped.maxTokens));
+
+  rmSync(dir3, { recursive: true, force: true });
   rmSync(donorDir, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------- 8. upstream-gone sweep
+console.log("\n8. Upstream-gone needs repeated, time-separated evidence");
+{
+  const { sweepUpstreamGone, retiredIds: readRetired } = await import(join(ROOT, "enclave-live.ts"));
+  const dir = mkdtempSync(join(tmpdir(), "enclave-sweep-"));
+  const catalog = { models: [{ id: "cyberouter/glm-5.3", routeable: true }, { id: "cyberouter/deepseek-v4-pro", routeable: true }], aliases: [] };
+
+  // Pass 1: one sighting is not enough.
+  state.chatMode = "upstream-410";
+  const p1 = await sweepUpstreamGone({ agentDir: dir, baseUrl: BASE, key: "k", signal, catalog });
+  check("pass 1 records a sighting", p1.gone.length === 2, JSON.stringify(p1.gone));
+  check("pass 1 retires nothing", p1.gone.every((g) => !g.retired));
+  check("pass 1 leaves the ledger empty", readRetired(dir).size === 0, [...readRetired(dir)].join(","));
+
+  // Pass 2 immediately: two strikes but not enough time apart -> still nothing.
+  const p2 = await sweepUpstreamGone({ agentDir: dir, baseUrl: BASE, key: "k", signal, catalog });
+  check("pass 2 too soon: still not retired", p2.gone.every((g) => !g.retired), JSON.stringify(p2.gone));
+
+  // Backdate the first sighting so the time gate is satisfied.
+  const { readFileSync: rf, writeFileSync: wf } = await import("node:fs");
+  const lp = join(dir, "enclave-retired.json");
+  const led = JSON.parse(rf(lp, "utf8"));
+  for (const k of Object.keys(led.upstreamGone ?? {})) {
+    led.upstreamGone[k].first -= 10 * 60_000;
+    led.upstreamGone[k].last -= 10 * 60_000;
+  }
+  wf(lp, JSON.stringify(led, null, 2));
+
+  const p3 = await sweepUpstreamGone({ agentDir: dir, baseUrl: BASE, key: "k", signal, catalog });
+  check("pass 3 (2 sightings + delay) retires", p3.gone.every((g) => g.retired), JSON.stringify(p3.gone));
+  check("retired ids reach the offline filter", readRetired(dir).size === 2, [...readRetired(dir)].join(","));
+
+  // Recovery clears the pending record and un-retires on the next live check.
+  state.chatMode = "ok";
+  const p4 = await sweepUpstreamGone({ agentDir: dir, baseUrl: BASE, key: "k", signal, catalog });
+  check("recovery reports revival", p4.revived.length === 2, JSON.stringify(p4.revived));
+  const p5 = await sweepUpstreamGone({ agentDir: dir, baseUrl: BASE, key: "k", signal, catalog });
+  check("a live catalog un-retires them", readRetired(dir).size === 0, [...readRetired(dir)].join(","));
+
+  // The refresh path must NOT clear an upstream-gone retirement: the catalog
+  // still lists these as routable, so a naive un-retire would resurrect them.
+  state.chatMode = "ok";
+  const ledgerPath2 = join(dir, "enclave-retired.json");
+  const led2 = JSON.parse(rf(ledgerPath2, "utf8"));
+  led2.retired["cyberouter/glm-5.3"] = { at: Date.now(), reason: "upstream-gone" };
+  led2.retired["cyberouter/deepseek-v4.1-flash"] = { at: Date.now(), reason: "not-routable" };
+  wf(ledgerPath2, JSON.stringify(led2, null, 2));
+  const refreshAfterSweep = makeRefreshModels({ agentDir: dir, baseUrlOverride: BASE });
+  await refreshAfterSweep(makeCtx().ctx);
+  const after = JSON.parse(rf(ledgerPath2, "utf8"));
+  check("refresh does NOT revive an upstream-gone retirement", after.retired["cyberouter/glm-5.3"]?.reason === "upstream-gone", JSON.stringify(after.retired));
+  check("refresh DOES clear a gateway-asserted retirement", after.retired["cyberouter/deepseek-v4.1-flash"] === undefined, JSON.stringify(after.retired));
+
+  rmSync(dir, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------- cleanup
