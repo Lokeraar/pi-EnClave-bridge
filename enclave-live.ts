@@ -65,8 +65,12 @@ export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
  * - `gateway`  — the endpoint's own declaration. Real, but a CLAIM.
  * - `vanilla`  — a conservative default used because nothing better was
  *                available. Honest, but not evidence.
+ * - `inherited`— borrowed from another provider's curated layer for the same
+ *                base model. Real evidence about the MODEL, but measured on a
+ *                DIFFERENT gateway, so it is a prior and not a measurement
+ *                here. Re-probe with `--all` when the chat endpoint answers.
  */
-export type ValueOrigin = "curated" | "measured" | "gateway" | "vanilla";
+export type ValueOrigin = "curated" | "measured" | "gateway" | "vanilla" | "inherited";
 
 export interface ValueProvenance {
   contextWindow: ValueOrigin;
@@ -162,6 +166,9 @@ const PROBE_BODY_MESSAGES = [
   { role: "system", content: "Be terse." },
   { role: "user", content: "hi" },
 ];
+
+/** Consecutive non-measurement probe failures before probing is abandoned. */
+const PROBE_FAILURE_LIMIT = 3;
 
 /** Non-chat ids the picker must never see. */
 const NOISE_PATTERN =
@@ -427,6 +434,8 @@ interface ProbeResult {
   status?: number;
   /** transport-level failure (timeout/conn/abort), not an HTTP rejection */
   net?: boolean;
+  /** truncated error body — the gateway tunnels the upstream status in here */
+  body?: string;
 }
 
 async function postChat(
@@ -444,7 +453,15 @@ async function postChat(
       body: JSON.stringify(body),
       signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
     });
-    if (!res.ok) return { ok: false, status: res.status };
+    if (!res.ok) {
+      let body = "";
+      try {
+        body = (await res.text()).slice(0, 400);
+      } catch {
+        /* body is best-effort; classification falls back to the status alone */
+      }
+      return { ok: false, status: res.status, body };
+    }
     const json = (await res.json()) as {
       usage?: { completion_tokens_details?: { reasoning_tokens?: number } };
     };
@@ -465,8 +482,42 @@ async function postChat(
  * or the router is down — which is precisely the state EnClave's chat endpoint
  * is in today (Vercel 500 on every model).
  */
-function isParameterRejection(status?: number): boolean {
-  return status === 400 || status === 422;
+/**
+ * Classify a failed probe call.
+ *
+ * The subtlety this exists for: EnClave's router is a TUNNEL. When the
+ * upstream inference provider rejects a parameter, the router answers `502`
+ * with a body reading `"Inference provider returned HTTP 400"`. That is
+ * semantically a parameter rejection wearing a 5xx costume, and treating the
+ * status alone as "not a measurement" would discard an otherwise valid
+ * measurement and lose the real output ceiling.
+ *
+ * So when the body carries an upstream status, that status is what counts:
+ *   400/422 upstream → parameter rejection (the model refused this shape)
+ *   410         upstream → the upstream resource is GONE (a retirement signal,
+ *                      and a permanent HTTP semantic rather than a blip)
+ *
+ * Everything else stays non-measurement: quota (402), auth (401/403), no
+ * route (404), rate limit (429), bare 5xx and transport errors.
+ */
+type FailureKind = "parameter" | "upstream-gone" | "no-route" | "other";
+
+const UPSTREAM_STATUS = /returned HTTP (\d{3})/i;
+
+function classifyFailure(status: number | undefined, body?: string): FailureKind {
+  if (status === 404) return "no-route";
+  const m = UPSTREAM_STATUS.exec(body ?? "");
+  if (m) {
+    const upstream = Number(m[1]);
+    if (upstream === 400 || upstream === 422) return "parameter";
+    if (upstream === 410) return "upstream-gone";
+    return "other";
+  }
+  return status === 400 || status === 422 ? "parameter" : "other";
+}
+
+function isParameterRejection(r: { status?: number; body?: string }): boolean {
+  return classifyFailure(r.status, r.body) === "parameter";
 }
 
 // ---------------------------------------------------------------------------
@@ -714,7 +765,7 @@ export async function probeNewModel(
 
   const noParam = await postChat(baseUrl, key, base, signal);
   // Quota/auth/rate-limit/5xx is not a measurement — do not derive values from it.
-  if (!noParam.ok && !isParameterRejection(noParam.status)) return undefined;
+  if (!noParam.ok && !isParameterRejection(noParam)) return undefined;
 
   const map: ThinkingLevelMap = {};
   let anyLevelOk = false;
@@ -723,7 +774,7 @@ export async function probeNewModel(
   for (const level of THINKING_LEVELS) {
     if (signal.aborted) return undefined;
     const r = await postChat(baseUrl, key, { ...base, reasoning_effort: level }, signal);
-    if (!r.ok && !isParameterRejection(r.status)) return undefined;
+    if (!r.ok && !isParameterRejection(r)) return undefined;
     map[level] = r.ok ? level : null;
     if (r.ok) anyLevelOk = true;
     if ((r.rt ?? 0) > 0) anyReasoningSeen = true;
@@ -732,7 +783,7 @@ export async function probeNewModel(
   // `off`: accepted AND zero reasoning tokens → "none"
   if (signal.aborted) return undefined;
   const none = await postChat(baseUrl, key, { ...base, reasoning_effort: "none" }, signal);
-  if (!none.ok && !isParameterRejection(none.status)) return undefined;
+  if (!none.ok && !isParameterRejection(none)) return undefined;
   map.off = none.ok && !(none.rt !== undefined && none.rt > 0) ? "none" : null;
   if ((none.rt ?? 0) > 0) anyReasoningSeen = true;
 
@@ -748,7 +799,7 @@ export async function probeNewModel(
     if (!r.ok) {
       // A timeout or quota error mid-walk is not a ceiling measurement; bail out
       // so the caller keeps the gateway-only values instead of a wrong floor.
-      if (!isParameterRejection(r.status)) return undefined;
+      if (!isParameterRejection(r)) return undefined;
       break;
     }
     highest = n;
@@ -801,6 +852,159 @@ export function readCurated(agentDir: string): LiveModelConfig[] {
   } catch {
     return []; // Missing or malformed: no curated layer, live layer still runs.
   }
+}
+
+// ---------------------------------------------------------------------------
+// Donor layer — inherit model-intrinsic values from another provider
+// ---------------------------------------------------------------------------
+
+/**
+ * A donor is another provider's curated model list, indexed by BARE model name
+ * (the id with any `vendor/` prefix removed on both sides). It exists because
+ * the same open-weight model is often sold through several gateways, and the
+ * facts about the MODEL — which reasoning-effort enum it accepts, whether it
+ * takes images — do not change with the seller, while everything about the
+ * GATEWAY does.
+ *
+ * What may cross over, and what may not:
+ *
+ *   reasoning, thinkingLevelMap, input  — intrinsic to the model. Safe to
+ *     inherit, because a vendor that rejects `reasoning_effort:"minimal"`
+ *     rejects it through every reseller.
+ *
+ *   contextWindow, maxTokens, cost      — properties of the gateway, NOT the
+ *     model, and never inherited. Concretely: OpenDesign reports
+ *     `maxTokens: 232000` for the DeepSeek family, but that is amr-link's
+ *     context budget, not the model's ceiling. Copying it would assert that
+ *     EnClave will let you emit 232k tokens — an unverified claim dressed as a
+ *     measured one, which is the single failure mode this bridge is built to
+ *     avoid. EnClave's own `context_length` and `pricing` always win.
+ *
+ * A donor is only ever a prior. It fills a field that has NO evidence yet, and
+ * never overwrites one that does. The origin it writes is `inherited`, not
+ * `curated`, so a reader can always tell which values were confirmed on this
+ * endpoint and which were carried in from elsewhere.
+ */
+
+const DONOR_FILE = "enclave-donor.json";
+
+export interface DonorConfig {
+  enabled: boolean;
+  /** Path to a Pi `models.json` holding the donor provider. */
+  modelsJson: string;
+  /** Provider key inside that file. */
+  provider: string;
+}
+
+export interface DonorIndex {
+  config: DonorConfig;
+  /** bare model name -> donor entry */
+  byBareName: Map<string, LiveModelConfig>;
+  /** bare names the donor has that no live model matched (report-only) */
+  source: Set<string>;
+}
+
+/**
+ * Which origins a donor is allowed to overwrite, per field.
+ *
+ * `vanilla` only means "fill the gap". `input` additionally allows `gateway`
+ * because EnClave's `architecture.modality` is a documented templated fill —
+ * the literal string "text" for all fourteen models with `tokenizer:"unknown"`
+ * — so a measured value from elsewhere is strictly better evidence than that
+ * declaration. `measured` and `curated` are never overwritten.
+ */
+const DONOR_FILL: Record<string, ValueOrigin[]> = {
+  reasoning: ["vanilla"],
+  thinkingLevelMap: ["vanilla"],
+  input: ["vanilla", "gateway"],
+};
+
+function bareName(id: string): string {
+  const i = id.lastIndexOf("/");
+  return i === -1 ? id : id.slice(i + 1);
+}
+
+/** Read the donor config; defaults to the sibling OpenDesign provider. */
+export function readDonorConfig(agentDir: string): DonorConfig {
+  const fallback: DonorConfig = {
+    enabled: true,
+    modelsJson: join(agentDir, "models.json"),
+    provider: "opendesign",
+  };
+  try {
+    const parsed = JSON.parse(readFileSync(join(agentDir, DONOR_FILE), "utf8")) as Partial<DonorConfig>;
+    return {
+      enabled: parsed.enabled !== false,
+      modelsJson: parsed.modelsJson ?? fallback.modelsJson,
+      provider: parsed.provider ?? fallback.provider,
+    };
+  } catch {
+    return fallback;
+  }
+}
+
+/** Build the bare-name index. An unreadable donor yields an empty index. */
+export function buildDonorIndex(config: DonorConfig): DonorIndex {
+  const byBareName = new Map<string, LiveModelConfig>();
+  const source = new Set<string>();
+  if (!config.enabled) return { config, byBareName, source };
+  try {
+    const parsed = JSON.parse(readFileSync(config.modelsJson, "utf8")) as {
+      providers?: Record<string, { models?: LiveModelConfig[] }>;
+    };
+    for (const m of parsed.providers?.[config.provider]?.models ?? []) {
+      if (!m || typeof m.id !== "string") continue;
+      const bare = bareName(m.id);
+      source.add(bare);
+      // First definition wins, so a duplicate cannot silently override.
+      if (!byBareName.has(bare)) byBareName.set(bare, m);
+    }
+  } catch {
+    // No donor file, or unreadable: the bridge simply runs without it.
+  }
+  return { config, byBareName, source };
+}
+
+export interface DonorResult {
+  model: LiveModelConfig;
+  /** fields actually taken from the donor, for reporting */
+  inherited: string[];
+}
+
+/**
+ * Fill evidence-free fields from the donor. Never overwrites `measured` or
+ * `curated`, and never touches a gateway-specific field.
+ */
+export function applyDonor(model: LiveModelConfig, donor: DonorIndex | undefined): DonorResult {
+  if (!donor || !donor.byBareName.size) return { model, inherited: [] };
+  const entry = donor.byBareName.get(bareName(model.id));
+  if (!entry) return { model, inherited: [] };
+
+  const next: LiveModelConfig = { ...model, provenance: { ...(model.provenance ?? ({} as ValueProvenance)) } };
+  const inherited: string[] = [];
+
+  // `reasoning` is a plain boolean with no provenance slot, so it is only filled
+  // when the model is still on the conservative default and the donor is typed.
+  if (DONOR_FILL.reasoning.includes(model.provenance?.thinkingLevelMap ?? "vanilla")) {
+    if (typeof entry.reasoning === "boolean" && entry.reasoning !== model.reasoning) {
+      next.reasoning = entry.reasoning;
+      inherited.push("reasoning");
+    }
+  }
+
+  for (const field of ["thinkingLevelMap", "input"] as const) {
+    const allowed = DONOR_FILL[field];
+    const current = (model.provenance?.[field] ?? "vanilla") as ValueOrigin;
+    if (!allowed.includes(current)) continue;
+    const donorValue = entry[field];
+    if (donorValue === undefined || donorValue === null) continue;
+    if (JSON.stringify(model[field]) === JSON.stringify(donorValue)) continue;
+    (next as Record<string, unknown>)[field] = donorValue;
+    (next.provenance as Record<string, unknown>)[field] = "inherited";
+    inherited.push(field);
+  }
+
+  return { model: next, inherited };
 }
 
 // ---------------------------------------------------------------------------
@@ -1064,7 +1268,19 @@ export interface RefreshModelsOptions {
   killSwitchEnv?: string;
   /** Env var name for the re-probe audit (default PI_ENCLAVE_REPROBE). */
   reprobeEnv?: string;
-  /** Set false to skip probing brand-new ids entirely. */
+  /** Env var name that opts INTO probing during refresh (default PI_ENCLAVE_PROBE). */
+  probeEnv?: string;
+  /**
+   * Probe brand-new ids during refresh. Off by DEFAULT.
+   *
+   * A probe is ~16 sequential requests per model. On a fourteen-model catalog
+   * that is minutes, and `refreshModels` is awaited during interactive startup
+   * — so probing there trades a correct catalog for a TUI that appears to
+   * hang. The gateway already declares context and price correctly, and the
+   * donor fills reasoning levels, so the default refresh publishes accurate
+   * values immediately; measurement is a deliberate step via the CLI
+   * (`--all`) or PI_ENCLAVE_REPROBE.
+   */
   probe?: boolean;
 }
 
@@ -1087,6 +1303,7 @@ export default async function enclaveLiveHelper(): Promise<void> {}
 export function makeRefreshModels(options: RefreshModelsOptions) {
   const envName = options.killSwitchEnv ?? "PI_ENCLAVE_LIVE";
   const fallbackBaseUrl = options.fallbackBaseUrl ?? ENCLAVE_BASE_URL;
+  const probeEnv = options.probeEnv ?? "PI_ENCLAVE_PROBE";
 
   return async function refreshModels(
     ctx: RefreshModelsContextLike,
@@ -1095,6 +1312,9 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
 
     const curated = readCurated(options.agentDir).map((m) => normalize(m));
     const curatedById = new Map(curated.map((m) => [m.id, m]));
+    // Read once per refresh. A missing or unreadable donor is not an error:
+    // `buildDonorIndex` yields an empty index and every fill is skipped.
+    const donor = buildDonorIndex(readDonorConfig(options.agentDir));
     const baseUrl = options.baseUrlOverride ?? fallbackBaseUrl;
     const storedModels = (ctx.stored?.models ?? []).filter(
       (m) => m && typeof m.id === "string" && (!m.provider || m.provider === PROVIDER_ID),
@@ -1116,7 +1336,8 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
       for (const m of [...liveStored, ...liveCurated]) if (!ids.includes(m.id)) ids.push(m.id);
       const merged = ids.map((id) => {
         const storedEntry = liveStored.find((m) => m.id === id);
-        return normalize(curatedById.get(id) ?? (storedEntry as LiveModelConfig));
+        const base = normalize(curatedById.get(id) ?? (storedEntry as LiveModelConfig));
+        return curatedById.has(id) ? base : applyDonor(base, donor).model;
       });
       if (ctx.signal.aborted) return undefined;
       if (!sameModels(merged, storedModels)) {
@@ -1144,6 +1365,16 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
     const bounds = catalogBounds(catalog.models);
     const out: LiveModelConfig[] = [];
 
+    // Circuit breaker for probing. A brand-new id costs ~8 sequential chat
+    // requests, and when the chat endpoint is down EVERY probe fails for a
+    // reason that says nothing about the model. Without this, a fourteen-model
+    // catalog would spend a minute failing before publishing anything. After
+    // PROBE_FAILURE_LIMIT consecutive non-measurements we stop probing for the
+    // rest of this refresh and let the gateway values stand — the honest
+    // degradation, reached in seconds instead of a minute.
+    let probeTripped = false;
+    let probeFailures = 0;
+
     for (const listing of catalog.models) {
       if (ctx.signal.aborted) return undefined;
       // `not-routable` is a retirement signal in its own right: the id is listed
@@ -1157,14 +1388,23 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
       }
       const previous = storedById.get(listing.id);
       if (previous) {
-        out.push(normalize(previous)); // already built in a past session
+        // Already built in a past session; the donor only fills evidence-free
+        // fields that a previous session could not resolve either.
+        out.push(applyDonor(normalize(previous), donor).model);
         continue;
       }
       // Brand-new id: probe only what the gateway does not declare.
-      const probed =
-        options.probe === false ? undefined : await probeNewModel(listing, baseUrl, key, ctx.signal);
+      let probed: LiveModelConfig | undefined;
+      const probingEnabled = options.probe ?? truthyEnv(probeEnv);
+      if (probingEnabled && !probeTripped) {
+        probed = await probeNewModel(listing, baseUrl, key, ctx.signal);
+        if (probed) probeFailures = 0;
+        else if (++probeFailures >= PROBE_FAILURE_LIMIT) probeTripped = true;
+      }
       if (ctx.signal.aborted) return undefined;
-      out.push(probed ?? gatewayModel(listing));
+      // A successful probe wins over the donor: it is a measurement ON this
+      // gateway. `applyDonor` only fills what the probe left as `vanilla`.
+      out.push(applyDonor(probed ?? gatewayModel(listing), donor).model);
     }
 
     for (const alias of catalog.aliases) {

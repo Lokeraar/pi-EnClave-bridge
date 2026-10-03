@@ -107,11 +107,20 @@ function originOf(model, field) {
 }
 
 // ---------------------------------------------------------------- fetch
-const signal = AbortSignal.any([AbortSignal.timeout(60_000)]);
+// A full probe is ~16 sequential requests per model (1 no-param + 6 levels +
+// none + up to 8 ceiling candidates) at roughly a second each. Fourteen models
+// is minutes of work, so the budget has to scale or the run aborts halfway and
+// every remaining model is mislabelled "probe-failed".
+const PROBE_TIMEOUT_MS = doProbe ? 15 * 60_000 : 60_000;
+const signal = AbortSignal.any([AbortSignal.timeout(PROBE_TIMEOUT_MS)]);
 const catalog = await fetchLiveCatalog(baseUrl, key, signal);
 if (!catalog) {
   console.error(`GET ${baseUrl}/models failed — endpoint unreachable or unauthorized.`);
   process.exit(1);
+}
+
+if (doProbe) {
+  console.error(`Probing ${catalog.models.length} models (~16 requests each); this takes minutes.\n`);
 }
 
 const curated = readCurated(agentDir).map((m) => ({ ...m, provenance: m.provenance }));

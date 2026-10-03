@@ -60,9 +60,9 @@ Two fields are **never** `measured`, on purpose:
 `cacheRead`/`cacheWrite` are `0` because the catalog publishes no cache rates.
 That `0` means *unpriced by the endpoint*, not *free* — hence the label.
 
-## Two retirement signals
+## Three states of "you can't use this"
 
-EnClave can retire a model two ways, and only the obvious one gets caught:
+Only the first is obvious, and the third is the one that will bite you.
 
 1. **`not-listed`** — a successful fetch stopped returning the id.
 2. **`not-routable`** — the id *is* listed, but `routeable_endpoint_count` is `0`
@@ -74,11 +74,53 @@ EnClave can retire a model two ways, and only the obvious one gets caught:
    Publishing such a model is the ghost-model bug: it looks selectable and fails
    100% of the time. As of 2026-10-03 that is `cyberouter/qwen3.8-flash`, which
    also has no published price.
+3. **`upstream-gone`** — the catalog says the model is healthy
+   (`routeable_endpoint_count > 0`) but the inference provider behind it is
+   gone. The router tunnels it as `502` with:
 
-Both are recorded in `<agentDir>/enclave-retired.json` with the reason, and both
-are enforced offline: a retired id is never restored from the store, so it
-cannot resurrect. Self-correcting — an id the endpoint serves again is
-un-retired with its curated values intact.
+   > Inference provider returned HTTP 410
+
+   `410 Gone` is a permanent HTTP semantic, not a blip, and the gateway's own
+   catalog has not caught up. As of 2026-10-03: `cyberouter/kimi-k2.6`,
+   `cyberouter/inkling`, and the `cyberouter/remediation` alias (which routes to
+   a dead task).
+
+States 1 and 2 are the gateway asserting structure, so they retire an id
+automatically. State 3 is the gateway being *wrong*, so it is **reported** by the
+CLI and the audit but does not retire anything on its own — a maintainer decides,
+because a transient upstream outage must not permanently drop a model.
+
+Retirements live in `<agentDir>/enclave-retired.json` with the reason, and are
+enforced offline: a retired id is never restored from the store, so it cannot
+resurrect. Self-correcting — an id the endpoint serves again is un-retired with
+its curated values intact.
+
+## The router is a tunnel — read the body, not just the status
+
+EnClave proxies other providers, and when the upstream rejects a request the
+router answers **`502`** with a body naming the upstream status:
+
+```
+POST /chat/completions  max_tokens=262144   → 200
+POST /chat/completions  max_tokens=393216   → 502 "Inference provider returned HTTP 400"
+POST /chat/completions  max_tokens=1048576  → 400 "This request needs about 1,048,594 tokens
+                                                (messages + tools + max_tokens)"
+```
+
+A `502` carrying an upstream `400` is a **parameter rejection wearing a 5xx
+costume**. Judging by status alone throws away a valid measurement and loses the
+real output ceiling — which is exactly what happened here: 12 of 14 models
+reported `probe-failed` until the classifier started reading the body. So
+`classifyFailure` prefers the upstream status when the body carries one:
+
+| Upstream status in body | Treated as |
+|---|---|
+| `400`, `422` | parameter rejection — a real measurement |
+| `410` | upstream permanently gone — reported, not auto-retired |
+| anything else | not a measurement |
+
+A bare `502`, or `402`, `401`, `403`, `429`, transport errors, remain
+non-measurements.
 
 ## Router aliases
 
@@ -104,10 +146,85 @@ asymmetry is deliberate:
 
 Capability fields are biased low. Money fields are biased high.
 
+## Donor layer — reusing another provider's curated values
+
+The same open-weight model is often sold through several gateways. The facts
+about the *model* — which `reasoning_effort` enum it accepts, whether it takes
+images — do not change with the seller. Everything about the *gateway* does.
+
+So this bridge can read another provider's curated layer and inherit those
+model-intrinsic values, indexed by **bare model name** (the id with any
+`vendor/` prefix stripped on both sides). By default it reads the sibling
+`opendesign` provider from the same `models.json`; override in
+`<agentDir>/enclave-donor.json`:
+
+```json
+{ "enabled": true, "modelsJson": "/path/to/models.json", "provider": "opendesign" }
+```
+
+**What may cross over:**
+
+| Field | Inherited | Why |
+|---|---|---|
+| `reasoning` | ✅ | A vendor that rejects a value rejects it through every reseller |
+| `thinkingLevelMap` | ✅ | Same — it is the vendor's enum, not the router's |
+| `input` | ✅ | And it beats EnClave's `modality`, which is a templated fill |
+
+**What never crosses over:**
+
+| Field | Why not |
+|---|---|
+| `contextWindow` | EnClave declares its own, and it is the gateway actually serving |
+| `maxTokens` | **The trap.** OpenDesign reports `232000` for the DeepSeek family, but that is *amr-link's context budget*, not the model's ceiling. Copying it would assert EnClave lets you emit 232k — an unverified claim dressed as a measured one |
+| `cost` | The price is the gateway's, down to the cent |
+
+A donor only ever fills a field that has **no evidence yet**, and the origin it
+writes is `inherited` — never `curated` and never `measured` — so you can always
+tell which values were confirmed on this endpoint and which were carried in.
+
+### Why it is a prior and not a truth
+
+Measured on this gateway, 2026-10-03, against what the donor claims:
+
+| Model | donor (amr-link) | measured (enclave) | |
+|---|---|---|---|
+| `deepseek-v4-pro` | `mlmhxm` | `mlmhxm` | ✅ |
+| `deepseek-v4-flash` | `mlmhxm` | `mlmhxm` | ✅ |
+| `glm-5.3-flash` | `lhm` | `mlmhxm` | ⚠️ donor **too restrictive** |
+| `deepseek-v4.1-flash` | `mlmhxm` | `lhxm` | ⚠️ donor **too permissive** |
+
+The misses go in **both** directions. A different host accepts a different slice
+of the enum, and nothing in the donor can tell you which way. That is the
+argument for measuring here — and the reason a probe, when it succeeds, always
+overrides the donor.
+
+Matching is **exact on the bare name**. `cyberouter/glm-5.3` does not inherit
+from `glm-5.3-flash`: a prefix relationship is not an identity, and those are
+different checkpoints at different prices.
+
 ## What actually gets probed
 
 Only the reasoning levels and the output ceiling, because the catalog says
-nothing about either. A probe measures `reasoning_effort` acceptance per level,
+nothing about either. Measured 2026-10-03:
+
+| Model | ctx | max out | effort accepted | `off` |
+|---|---|---|---|---|
+| `glm-5.3-flash` | 1 048 576 | 524 288 | minimal low medium high xhigh max | rejected |
+| `glm-5.2` | 1 048 576 | 262 144 | all six | `none` |
+| `deepseek-v4-pro` | 1 048 576 | 524 288 | all six | `none` |
+| `deepseek-v4.1-flash` | 1 048 576 | 524 288 | low high xhigh max | `none` |
+| `deepseek-v4-flash` | 1 048 576 | 262 144 | all six | `none` |
+| `qwen3.8-max` | 1 010 000 | 524 288 | low max | rejected |
+| `kimi-k3` | 1 048 576 | 262 144 | all six | `none` |
+| `gpt-oss-120b` | 131 072 | 32 768 | all six | `none` |
+| `minimax-m3` | 524 288 | 393 216 | all six | rejected |
+| `nemotron-ultra` | 262 144 | 131 072 | all six | `none` |
+| `glm-5.3` | 1 048 576 | — | probe did not settle |
+| `kimi-k2.6`, `inkling` | — | — | upstream 410 gone |
+
+Note the `off` column: `none` means accepted **and** verified to produce zero
+reasoning tokens. `rejected` means the gateway refused it, so Pi hides the
+option instead of sending a value that would 400. A probe measures `reasoning_effort` acceptance per level,
 the real semantics of `off`, and walks the output ceiling upward.
 
 The walk reports the **last accepted candidate**, which is a floor on the real
@@ -147,7 +264,20 @@ the gateway does not declare.
 |---|---|
 | `ENCLAVE_API_KEY` | Credential for the CLI. The extension takes it from `/login` |
 | `PI_ENCLAVE_LIVE=0` | Kill switch — freezes the catalog |
+| `PI_ENCLAVE_PROBE=1` | Opt **in** to probing brand-new ids during refresh (off by default — see below) |
 | `PI_ENCLAVE_REPROBE=1` | Re-check curated values against the endpoint and write `<agentDir>/enclave-reprobe.json` |
+
+### Why probing is off by default in the refresh path
+
+A probe is ~16 sequential requests per model. On a fourteen-model catalog that is
+three minutes, and `refreshModels` is awaited during interactive startup — so
+probing there trades a correct catalog for a TUI that appears to hang.
+
+The gateway declares context and price correctly, and the donor fills reasoning
+levels, so the default refresh publishes accurate values immediately. Measuring
+is a deliberate step: `probe-models.mjs --all`, or `PI_ENCLAVE_PROBE=1` if you
+want it automatic. A circuit breaker also caps the damage: after three
+consecutive non-measurements, probing is abandoned for the rest of the refresh.
 
 ## Tests
 
@@ -155,26 +285,46 @@ the gateway does not declare.
 node --experimental-strip-types scripts/test-bridge.mjs
 ```
 
-28 checks against a **mock** gateway: live membership, the routability filter,
-both retirement signals, ledger-blocked offline resurrection, the 500-is-not-a-
-measurement rule, measured vs gateway provenance, ceiling conservatism, and
-curated precedence.
+43 checks against a **mock** gateway: live membership, the routability filter,
+both retirement signals, ledger-blocked offline resurrection, the
+500-is-not-a-measurement rule, the tunnelled `502`/upstream-`400` rule, upstream
+`410` is not a rejection, measured vs gateway provenance, ceiling conservatism,
+curated precedence, and every donor rule including the `maxTokens` trap and the
+near-miss guard.
 
-## Known endpoint state (2026-10-03)
+## Endpoint state (measured 2026-10-03)
 
-`GET /v1/models` answers `200`. **`POST /v1/chat/completions` answers `500
-Internal Server Error` from Vercel on every model, every alias, with and
-without `stream:true`, and with OpenRouter-style headers.** Without a
-credential it answers `401`, so the key is valid — this is an upstream router
-failure, not a local one.
+The router was briefly returning `500` on every chat request during the first
+recon; it recovered within the hour. Do not treat any single observation as
+durable — run the CLI to see the current state. As measured:
 
-The consequence: reasoning levels and output ceilings cannot be measured yet.
-The bridge degrades honestly — those fields stay `vanilla` and say so in
-`provenance`, instead of inventing values. When the router recovers:
+| | |
+|---|---|
+| `GET /v1/models` | `200`, 14 models + 5 aliases |
+| `POST /v1/chat/completions` | `200` on 15 of 19 ids |
+| `qwen3.8-flash` | `404` — no routeable endpoint (matches `routeable_endpoint_count: 0`) |
+| `kimi-k2.6`, `inkling`, `remediation` | `502` — upstream returned `410 Gone` |
+| latency | 0.6–2.6 s per call; a full `--all` probe is ~3 minutes |
+
+## Fixing a broken `models.json`
+
+Pi drops the **entire** `models.json` if a single entry fails schema validation —
+and its `input` only allows `text` and `image`. An entry declaring
+`["text","image","audio","video"]` is invalid, which silently kills every
+provider in the file, including the inline `apiKey` markers that authenticate
+them.
+
+If `pi --list-models` prints `Warning: errors loading models.json` and your
+providers vanish, that is why. Check with:
 
 ```bash
-node --experimental-strip-types scripts/probe-models.mjs --all
+jq -r '.providers | to_entries[] | .key as $p | .value.models[]
+        | select(.input|length>2) | "\($p)/\(.id)"' ~/.pi/agent/models.json
 ```
+
+Audio and video are not representable in Pi's model schema at all; trim the
+array to `["text","image"]`. Doing that restored both this bridge and the
+`opendesign` curated layer in one shot.
 
 ## Privacy
 
