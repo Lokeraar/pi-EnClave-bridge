@@ -1,208 +1,245 @@
-# pi-EnClave-bridge
+# @lokeraar/pi-enclave-bridge
 
-EnClave provider for [Pi](https://pi.dev). The live router catalog appears in
-`/model` with real context windows and real per-token prices.
+EnClave provider for [Pi](https://pi.dev). The live router catalog shows up in
+`/model` with **real context windows, real per-token prices, live membership and
+the router's task aliases** — resolved from the model catalog Pi already ships,
+with no extra account required.
 
-## Local install
+## ⚡ Quick Start
 
 ```bash
-cp index.ts enclave-live.ts ~/.pi/agent/extensions/
-mv ~/.pi/agent/extensions/index.ts ~/.pi/agent/extensions/enclave-bridge.ts
+pi install npm:@lokeraar/pi-enclave-bridge
 ```
 
-Rename it: Pi loads every `extensions/*.ts` as a factory, so a file called
-`index.ts` collides and registers the provider twice. Then `/reload`.
+Then log in once:
 
-## How values are decided
+```
+/login EnClave
+```
 
-The model values live in `models.json` under `providers.EnClave`. One script
-rebuilds that block:
+The catalog builds itself. `/model` shows every model the router serves for your
+key, with the values resolved and each one attributed to where it came from.
+
+> **Local copies conflict.** If you also keep `enclave-bridge.ts` in
+> `~/.pi/agent/extensions/`, remove it first. Two registrations of the same
+> provider fight over the model list. `PI_ENCLAVE_LIVE=0` does not fix this; only
+> removing one of them does.
+
+## Why this package exists
+
+EnClave's router (`https://router.enclave.ai/v1`) is an OpenAI-compatible
+gateway, and its `/models` endpoint is unusually honest: it declares the context
+window, the price per million tokens, and whether *your* key has a healthy route
+to each model.
+
+It is still silent on the things a coding agent actually needs to make decisions:
+which reasoning-effort values the model implements, whether it takes images, and
+how much output it will really produce. Left alone, a config file fills those
+with round placeholder numbers that look exactly like facts.
+
+This package resolves them, and never invents one.
+
+## ⚙️ How it works
+
+Two layers, in strict order:
+
+```
+the vendor's own model card  >  openrouter  >  the other 41 catalogs Pi ships
+what is already in models.json is the fallback, used only when no catalog
+knows the model at all
+```
+
+**The vendor's card outranks everything.** A catalog records what a *reseller*
+believes a model accepts; the card records what the model *implements*. When they
+disagree the catalog is usually not lying — it is describing the gateway's shape.
+EnClave accepts all six effort values for `glm-5.3`; the card says the model only
+implements low, high and max. The extra values are accepted and then ignored,
+which is worse than not offering them: Pi would show a thinking level that
+silently does nothing.
+
+**OpenRouter leads the catalogs.** It is the largest model router in the world
+and the catalog is its core business. The other catalogs Pi ships (42 of them)
+confirm that a model exists and agree on its structure; they fill a field the ones
+above left empty and never override.
+
+**Nothing is averaged.** A number nobody published is not a consensus, it is an
+invention. Where two sources disagree, the higher-ranked one wins and the other
+is recorded as dissent.
+
+**No credential is needed to read a catalog.** The files live in Pi's own package
+(`pi-ai/dist/providers/data/`). A key is only needed to *call* an API, not to
+read what Pi already installed — so a fresh Pi with no accounts anywhere still
+gets the full catalog.
+
+### 🔎 Two refresh phases
+
+Pi drives the refresh; the extension never invents a value in it.
+
+| Phase | When | What it does |
+|---|---|---|
+| **Cache-only restore** | Every runtime creation | Rebuilds the catalog from `models.json` plus the store. Instant, works offline. |
+| **Live membership** | Interactive startup, `/model` search | Fetches `/models` and adds ids the endpoint started serving, drops ids it stopped. |
+
+Live membership only ever changes *who* is in the list. The values come from
+`models.json`, which `scripts/sync-models.mjs` owns.
+
+Kill switch: `PI_ENCLAVE_LIVE=0` freezes the catalog.
+
+### 🏷️ Which models get published
+
+A model appears only if the router lists it, `routeable_endpoint_count > 0`, and
+it answers a request.
+
+Three ways a listed model can still be unusable, and all three are handled:
+
+| Signal | What it means |
+|---|---|
+| listed, `routeable_endpoint_count: 0` | Your key has no healthy route. Every request 404s. |
+| answers `502 "provider returned HTTP 410"` | The catalog calls it healthy; the inference provider behind it is gone. `410 Gone` is permanent, not a blip. |
+| simply absent from `/models` | Retired upstream. |
+
+The third one had a real effect: `cyberouter/remediation` is a router alias that
+routes by task score, and it was failing because the top-scoring remediation
+model was one of the dead ones.
+
+### 🔀 Router aliases
+
+`cyberouter/auto` plus one per security task (`vuln-discovery`, `exploit-dev`,
+`remediation`, `triage`) are usable as a model and are published.
+
+They live in a sibling field of the catalog, not inside `data`, so a parser that
+only reads `data` silently loses all five. Their window and price depend on which
+concrete model the router picks per request, so both are bounded rather than
+guessed: context at the catalog floor, price at the catalog ceiling.
+
+They are deliberately **never** resolved from a catalog. OpenRouter has a model
+called `auto` too, advertising a 2,000,000 window — a different thing that shares
+the name, and a lie here.
+
+## 🔑 Authentication
+
+```
+/login EnClave
+```
+
+The key lives in `~/.pi/agent/auth.json`, managed by Pi. The catalog needs no key;
+only live membership and the liveness check do.
+
+## 📊 Models
+
+Values are resolved per model and written to `providers.EnClave.models` in
+`models.json`. Each one records exactly where it came from:
+
+```json
+"donor": {
+  "source": "openrouter",
+  "matchedId": "qwen/qwen3.8-max-0902",
+  "corroborating": ["opencode", "opencode-go", "qwen-token-plan", "…"],
+  "rule": "corroborated"
+}
+```
+
+`matchedId` is the **full id with its prefix**, not the short name, so a match can
+be audited without guessing — including when it resolved through a dated vendor
+slug.
+
+### What a donor may not set
+
+| Field | Owner | Why |
+|---|---|---|
+| `contextWindow` | the live catalog | It states what this endpoint actually serves. |
+| `cost` | the live catalog | A catalog's price is for a different reseller. |
+| `compat` | never inherited | `thinkingFormat: "openrouter"` and friends describe how *OpenRouter* wants reasoning framed. EnClave speaks the OpenAI shape. |
+
+### The ceiling clamp
+
+An output ceiling larger than the context can hold is not a bigger claim, it is an
+impossible one — a request cannot ask for more output than the window contains,
+and the endpoint says so:
+
+> This request needs about N tokens (messages + tools + max_tokens)
+
+A donor value is therefore clamped to the window minus a 2,048-token prompt
+reserve. It cannot equal the window either: measured, 262,144 was rejected while
+261,120 passed.
+
+A value inside the limit is used exactly as given. The clamp removes
+impossibilities; it does not second-guess the catalog.
+
+In practice the published value is a **ceiling, not a fixed request**. Pi reduces
+it per turn to `min(published, contextWindow − prompt − 4096)`.
+
+## 🧠 Reasoning controls
+
+Each model gets a `thinkingLevelMap`. A level mapped to `null` is not offered, so
+Pi snaps to the nearest supported level instead of sending a value the gateway
+refuses. `off: null` means thinking cannot be switched off and the option is
+hidden entirely.
+
+Two models carry a vendor card that narrows what the catalog claims:
+
+| Model | Card says | Catalog claims |
+|---|---|---|
+| `glm-5.3` | 131 072 out · low, high, max · text only | 943 718 out · six levels |
+| `glm-5.2` | 131 072 out · high, max · text only | 943 718 out · six levels |
+
+## ⚙️ Configuration
+
+| Variable | Effect |
+|---|---|
+| `ENCLAVE_API_KEY` | Credential for the maintenance script. The extension takes it from `/login`. |
+| `PI_ENCLAVE_LIVE=0` | Kill switch — freezes the catalog. |
+
+## 🚀 Development
+
+```bash
+git clone https://github.com/Lokeraar/pi-EnClave-bridge
+cd pi-EnClave-bridge
+npm test
+```
+
+### Where each value comes from
+
+The catalog Pi ships is at:
+
+```
+<pi-ai>/dist/providers/data/<provider>.json
+```
+
+42 of them, keyed by API and then by model id. The directory name carries the
+pi-ai version and a dependency hash, so it changes on every Pi update and any
+stored path dies with it — the lookup therefore walks the tree at run time, asking
+Node to resolve the copy Pi loads first and falling back to the agent's store.
+
+Models whose id ends in `free` are skipped: they routinely ship with capabilities
+cut down, so their numbers describe a reduced product.
+
+### Maintaining the curated values
+
+Report-only. It never writes without you asking, and the diff is the deliverable.
 
 ```bash
 node --experimental-strip-types scripts/sync-models.mjs --dry-run
 node --experimental-strip-types scripts/sync-models.mjs
 ```
 
-It reads the live catalog, then for each model, in order:
+It reports which donor supplied each value, who corroborated it, what is still
+missing, and what it excluded. Then it writes `models.json` and leaves a backup.
 
-1. **Donor** — `providers.opendesign` in the same `models.json`, matched on the
-   **bare model name**: the id with any `vendor/` prefix stripped on both sides,
-   so `cyberouter/glm-5.3-flash` matches `glm-5.3-flash`. The donor's values are
-   copied onto the EnClave entry wholesale.
-2. **Existing** — with no donor, whatever the block already says. That is where
-   hand-measured values live.
-3. **Pending** — with neither, the script reports it. That is the work left to
-   do by hand; nothing is invented.
+To add a vendor correction, add it to `VENDOR_SPEC` in `donors.ts` with the reason
+it exists, so a later reader can check it against the model card.
 
-**The donor is the source of truth.** Its numbers are copied as they are, even
-when they are larger than a local measurement found. A value chosen on purpose
-beats one the tool inferred. If a value ever causes a problem, lower it
-deliberately then — not preemptively in the script.
-
-Two fields are never taken from the donor, because they describe the endpoint
-rather than the model:
-
-| Field | Source |
-|---|---|
-| `contextWindow` | the catalog's `context_length` — what actually serves |
-| `cost` | `pricing.prompt` / `pricing.completion` — the donor has no price at all |
-
-A prefix relationship is not an identity: `cyberouter/glm-5.3` does **not**
-inherit from `glm-5.3-flash`.
-
-## Which models get published
-
-A model appears only if the catalog lists it, `routeable_endpoint_count > 0`,
-and it answers a request. `--no-check` skips the liveness probe.
-
-As of 2026-10-03 that excludes three: `qwen3.8-flash` (listed with no healthy
-route), and `kimi-k2.6` + `inkling` (healthy in the catalog, but the inference
-provider answers `502 "Inference provider returned HTTP 410"`). The
-`cyberouter/remediation` alias goes with them, because it routes by task score
-and its two best remediation models are the dead ones.
-
-## Router aliases
-
-`cyberouter/auto` plus one per security task. They live in a sibling field of the
-catalog, not inside `data`, so a parser that only reads `data` loses all five.
-Their window and price depend on which concrete model the router picks per
-request, so both are bounded: context at the catalog floor, price at the ceiling.
-
-## Extension
-
-`index.ts` registers the provider and keeps the model list in step with the
-endpoint — adding ids the endpoint started serving, dropping ones it stopped. It
-never invents a value. `PI_ENCLAVE_LIVE=0` freezes the catalog.
-
-## Tests
+### Tests
 
 ```bash
 node --experimental-strip-types scripts/test-sync.mjs
 ```
 
-19 offline checks: bare-name stripping, the donor join, the near-miss guard, the
-route filter, gateway ownership of context and price, and alias bounds.
-
-## Privacy
-
-The router fails closed on ZDR — it will not downgrade retention, health,
-quantization or model to find a route. A model it cannot serve under those
-constraints is simply unavailable.
+58 offline checks: bare-name matching and the near miss that must not match, the
+model-card precedence, the strict donor order, nothing-averaged, free-model
+exclusion, dated slugs, alias exclusion, the ceiling clamp, and a simulated Pi
+update that renames the catalog folder.
 
 ## License
 
 MIT
-
-## Donors: where the values come from
-
-A **donor** is another list of models whose values get copied onto ours, matched
-on the **bare model name** — the id with any `vendor/` prefix stripped on both
-sides, so `cyberouter/glm-5.3-flash` matches `glm-5.3-flash`. A prefix
-relationship is not an identity: `cyberouter/glm-5.3` does **not** inherit from
-`glm-5.3-flash`.
-
-There are two kinds, and they are not equal in authority.
-
-### The order
-
-```
-the vendor's own model card  >  openrouter  >  the rest of Pi's catalogs
-what is already in models.json is the fallback, used only when no catalog
-knows the model at all.
-```
-
-**Nothing outranks the model card.** A catalog records what a *reseller*
-believes a model accepts; the card records what the model *implements*. When
-they disagree the catalog is usually not lying — it is describing the gateway's
-shape. EnClave accepts all six effort values for `glm-5.3`; the card says the
-model only implements low, high and max. The extra values are accepted and then
-ignored, which is worse than not offering them: Pi would show a thinking level
-that silently does nothing. Same for the ceiling — OpenRouter declares 943,718
-and this endpoint rejects it outright.
-
-Cards are recorded in `VENDOR_SPEC` in `donors.ts`, each entry carrying the
-reason it exists so a later reader can check it:
-
-| Model | Card says | OpenRouter says |
-|---|---|---|
-| `glm-5.3` | 131 072 out, low/high/max, text only | 943 718 out, six levels |
-| `glm-5.2` | 131 072 out, high/max, text only | 943 718 out, six levels |
-
-Everything else falls through to the order below.
-
-There is **no hand-written donor**, and none is required. Two reasons:
-
-- A list maintained by a person goes stale. The person maintaining it will,
-  eventually, be wrong and not notice.
-- It would be a prerequisite: every user would need an account with an obscure
-  provider before the extension does anything useful. A hand-written list also
-  cannot travel with the package — it belongs to whoever wrote it, not to
-  everyone who installs it.
-
-So the donor is the catalog **Pi already ships**:
-
-```
-pi-ai/dist/providers/data/<provider>.json
-```
-
-42 of them, and reading a file needs **no credential** — a key is only needed to
-CALL an API, not to read what Pi installed. A fresh Pi install with no accounts
-anywhere still resolves the full catalog.
-
-```
-openrouter   the primary donor. It is the largest model router in the world and
-             the catalog is its core business, so the numbers are kept by
-             people who cannot afford to be wrong.
-the rest     corroboration only. They confirm the model exists and agree on its
-             structure; they fill a field the ones above left empty and never
-             override.
-```
-
-**What is already written wins**, because it is specific to this endpoint. Inside
-a 5% band the catalog takes over, since `128_000` and `131_072` are the same
-number written differently and the second is exact. Outside the band they
-genuinely disagree and what is written stands.
-
-**Nothing is ever averaged.** A number nobody published is not a consensus, it is
-an invention — and averaging a correct catalog against a wrong one produces a
-value neither stands behind. Where catalogs disagree, the higher-ranked one wins
-and the others are recorded as dissent.
-
-`compat` is deliberately **never** inherited from a catalog. OpenRouter ships
-`thinkingFormat: "openrouter"` and friends, which describe how *OpenRouter*
-wants reasoning sent. EnClave speaks the OpenAI shape — that is how it was
-verified, by sending `reasoning_effort` and watching what came back. Copying
-those flags would change the request format on an endpoint they were never
-tested against.
-
-### What no donor may set
-
-| Field | Owner | Why |
-|---|---|---|
-| `contextWindow` | the live catalog | it is what this endpoint actually serves |
-| `cost` | the live catalog | a donor's price is for a different reseller |
-
-### Router aliases are never resolved
-
-`cyberouter/auto` is EnClave's own pseudo-model. OpenRouter has an `auto` too,
-advertising a 2,000,000 window — a different thing that happens to share the
-name, and a lie here. Aliases are left vanilla on purpose.
-
-### The one clamp: an impossible ceiling
-
-An output ceiling larger than the context can hold is not a bigger claim, it is
-an impossible one — a request cannot ask for more output than the window
-contains. EnClave rejects it outright:
-
-> This request needs about N tokens (messages + tools + max_tokens)
-
-OpenRouter lists `inkling` at 471,859 against a 262,144 window here, so this is
-not hypothetical. The ceiling is clamped to the window **minus a 2,048-token
-prompt reserve**. Note it cannot equal the window either: measured on `inkling`,
-262,144 was rejected while 261,120 passed.
-
-A value inside the limit is used exactly as given. The clamp removes
-impossibilities; it does not second-guess the donor.
-
-`maxTokens` must also never be `null`: Pi's model list calls `.toString()` on it
-and crashes with `Cannot read properties of undefined`.
