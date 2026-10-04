@@ -121,13 +121,14 @@ const report = [
   ``,
   `Resueltos desde un donante: ${[...result.resolved.values()].filter((r) => r.source).length}`,
   ``,
-  `Orden de autoridad: ya escrito > openrouter > el resto de los catálogos de Pi`,
+  `Orden: model card del vendor > openrouter > otros catálogos (solo confirman).`,
 ];
 
 const grouped = [
-  ["ya escrito en models.json, confirmado por un catálogo", byRule("corroborated")],
-  ["ya escrito en models.json", byRule("kept")],
-  ["catálogo de Pi (sin valor previo)", byRule("exact")],
+  ["model card del vendor (máxima autoridad)", byRule("vendor")],
+  ["de openrouter, confirmado por otros catálogos", byRule("corroborated")],
+  ["de openrouter", byRule("donated")],
+  ["sin donante: queda lo ya escrito", byRule("kept")],
 ];
 for (const [label, rows] of grouped) {
   if (!rows.length) continue;
@@ -138,7 +139,7 @@ for (const [label, rows] of grouped) {
     const shown = r.corroborating.slice(0, 3).join(", ");
     const more = n > 3 ? ` +${n - 3} más` : "";
     const corr = n ? `   confirmado por ${n}: ${shown}${more}` : "";
-    report.push(`    ${short(id).padEnd(24)} ${r.source ?? "-"}${corr}`);
+    report.push(`    ${short(id).padEnd(22)} ${r.matchedId ?? "-"}`.padEnd(52) + ` ${r.source ?? "-"}${corr}`);
   }
 }
 

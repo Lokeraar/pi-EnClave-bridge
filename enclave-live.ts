@@ -278,7 +278,12 @@ export function buildBlock(
       },
       api: "openai-completions",
       donor: r.source
-        ? { source: r.source, corroborating: r.corroborating, rule: r.rule === "none" ? "kept" : r.rule }
+        ? {
+            source: r.source,
+            matchedId: r.matchedId,
+            corroborating: r.corroborating,
+            rule: r.rule,
+          }
         : undefined,
     };
     models.push(entry);

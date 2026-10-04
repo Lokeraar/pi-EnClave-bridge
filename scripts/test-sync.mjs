@@ -42,34 +42,58 @@ check("strips a vendor prefix", bareName("cyberouter/glm-5.3") === "glm-5.3");
 check("leaves an unprefixed id alone", bareName("glm-5.3") === "glm-5.3");
 check("strips only the last segment", bareName("a/b/c") === "c");
 
-console.log("\nwhat is already written is the top authority");
+console.log("\nthe vendor's model card outranks every catalog");
 {
-  const r = resolveModel("glm-5.2", { maxTokens: 262144, input: ["text"] }, [cat("openrouter", { "glm-5.2": { maxTokens: 131072, input: ["text"] } })], false);
-  check("a large disagreement keeps what is written", r.entry.maxTokens === 262144, String(r.entry.maxTokens));
-  check("and it is attributed to models.json", r.source === "models.json", String(r.source));
+  const { VENDOR_SPEC } = await import(join(ROOT, "donors.ts"));
+  check("glm-5.3 has a card", !!VENDOR_SPEC["glm-5.3"]);
+  check("glm-5.2 has a card", !!VENDOR_SPEC["glm-5.2"]);
+  check("each card records why it exists", Object.values(VENDOR_SPEC).every((v) => v.why.length > 40));
+
+  // A catalog that claims 943718 and all six levels must not win.
+  const loud = cat("openrouter", {
+    "glm-5.3": { maxTokens: 943718, input: ["text", "image"], thinkingLevelMap: { off: null, minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } },
+  });
+  const r = resolveModel("glm-5.3", undefined, [loud], false);
+  check("the card sets the output ceiling", r.entry.maxTokens === 131072, String(r.entry.maxTokens));
+  check("the card sets the modalities", JSON.stringify(r.entry.input) === '["text"]', JSON.stringify(r.entry.input));
+  check("the card keeps only the implemented levels",
+    Object.entries(r.entry.thinkingLevelMap).filter(([, v]) => v !== null).map(([k]) => k).join(",") === "low,high,max",
+    JSON.stringify(r.entry.thinkingLevelMap));
+  check("it is attributed to the model card", r.source === "model card", String(r.source));
+  check("the catalog is still recorded as corroboration", r.corroborating.includes("openrouter"), r.corroborating.join(","));
+
+  // The card applies to the exact name only; a neighbour is untouched.
+  const neighbour = resolveModel("glm-5.3-flash", undefined, [loud], false);
+  check("the card does not bleed to a neighbour", neighbour.entry.maxTokens === undefined, String(neighbour.entry.maxTokens));
 }
 
-console.log("\nrounding is not a disagreement");
+console.log("\nopenrouter decides; what is written is only a fallback");
 {
-  const far = resolveModel("deepseek-v4-flash", { maxTokens: 232000 }, [cat("openrouter", { "deepseek-v4-flash": { maxTokens: 384000 } })], false);
-  check("outside the band what is written stays", far.entry.maxTokens === 232000, String(far.entry.maxTokens));
+  // A catalog that contradicts what is written: the catalog wins, because it is
+  // the source of truth the user chose.
+  const r = resolveModel("deepseek-v4-pro", { maxTokens: 232000 }, [cat("openrouter", { "deepseek-v4-pro": { maxTokens: 384000 } })], false);
+  check("the catalog overrides what was written", r.entry.maxTokens === 384000, String(r.entry.maxTokens));
+  check("and it is attributed to openrouter", r.source === "openrouter", String(r.source));
 
-  const close = resolveModel("glm-5.3-flash", { maxTokens: 128000 }, [cat("openrouter", { "glm-5.3-flash": { maxTokens: 131072 } })], false);
-  check("inside the band the exact bundled figure wins", close.entry.maxTokens === 131072, String(close.entry.maxTokens));
-  check("the band is 5%", Math.abs(ROUNDING_TOLERANCE - 0.05) < 1e-9, String(ROUNDING_TOLERANCE));
-}
+  // Two catalogs disagree: the primary wins outright, never a midpoint.
+  const two = resolveModel("minimax-m3", undefined, [cat("openrouter", { "minimax-m3": { maxTokens: 512000 } }), cat("opencode", { "minimax-m3": { maxTokens: 128000 } })], false);
+  check("the highest-priority catalog supplies the value", two.entry.maxTokens === 512000, String(two.entry.maxTokens));
+  check("NOT the midpoint of the two", two.entry.maxTokens !== 320000, String(two.entry.maxTokens));
+  check("the lower one is recorded as corroboration", two.corroborating.join(",") === "opencode", two.corroborating.join(","));
 
-console.log("\nstrict order, nothing is averaged");
-{
-  const r = resolveModel("minimax-m3", undefined, [cat("openrouter", { "minimax-m3": { maxTokens: 512000 } }), cat("opencode", { "minimax-m3": { maxTokens: 128000 } })], false);
-  check("the highest-priority catalog supplies the value", r.entry.maxTokens === 512000, String(r.entry.maxTokens));
-  check("NOT the midpoint of the two", r.entry.maxTokens !== 320000, String(r.entry.maxTokens));
-  check("the lower one is recorded as corroboration", r.corroborating.join(",") === "opencode", r.corroborating.join(","));
-  check("the source is named", r.source === "openrouter", String(r.source));
+  // Nothing in any catalog knows the model: what is written stands.
+  const orphan = resolveModel("orphan", { maxTokens: 999, thinkingLevelMap: { low: "low" } }, [cat("openrouter", {})], false);
+  check("what is written is the fallback", orphan.entry.maxTokens === 999, String(orphan.entry.maxTokens));
+  check("and it is attributed to models.json", orphan.source === "models.json", String(orphan.source));
 
-  const h = resolveModel("minimax-m3", { maxTokens: 400000 }, [cat("openrouter", { "minimax-m3": { maxTokens: 512000 } }), cat("opencode", { "minimax-m3": { maxTokens: 128000 } })], false);
-  check("what is written outranks both", h.entry.maxTokens === 400000, String(h.entry.maxTokens));
-  check("both lower providers corroborate", h.corroborating.join(",") === "openrouter,opencode", h.corroborating.join(","));
+  // compat is never taken from a catalog, whatever else is.
+  const withCompat = resolveModel("deepseek-v4-pro", undefined, [cat("openrouter", { "deepseek-v4-pro": { maxTokens: 1000, compat: { thinkingFormat: "openrouter" } } })], false);
+  check("compat is never inherited from a catalog", withCompat.entry.compat === undefined, JSON.stringify(withCompat.entry.compat));
+
+  // A dated slug is still resolved and recorded with its full id.
+  const dated = resolveModel("qwen3.8-max", undefined, [cat("openrouter", { "qwen3.8-max-0902": { id: "qwen/qwen3.8-max-0902", maxTokens: 131072 } })], false);
+  check("a dated slug resolves", dated.entry.maxTokens === 131072, String(dated.entry.maxTokens));
+  check("and the matched id keeps its prefix", dated.matchedId === "qwen/qwen3.8-max-0902", String(dated.matchedId));
 }
 
 console.log("\nfree models are excluded, no credential needed");

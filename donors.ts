@@ -76,7 +76,21 @@ export interface ModelEntry {
    * Set by the sync script. `source` supplied the values; `corroborating`
    * lists the other providers that also know the model and agree it exists.
    */
-  donor?: { source: string; corroborating: string[]; rule: "kept" | "exact" | "corroborated" | "none" };
+  donor?: {
+    /** The provider that supplied the values. */
+    source: string;
+    /**
+     * The exact id that matched, WITH its prefix — `qwen/qwen3.8-max-0902`, not
+     * `qwen3.8-max`. Matching is done on the bare name because the two sides
+     * carry different vendor prefixes, but recording the full id is what makes a
+     * match auditable: you can see which entry was taken, including when it came
+     * from a dated slug.
+     */
+    matchedId?: string;
+    /** Other catalogs that also know this model. They confirm, never override. */
+    corroborating: string[];
+    rule: "vendor" | "donated" | "kept" | "corroborated" | "none";
+  };
   [key: string]: unknown;
 }
 
@@ -381,13 +395,54 @@ export function readPiCatalogs(agentDir: string, options: { exclude?: readonly s
  */
 export const PROVIDER_PRIORITY = ["openrouter"] as const;
 
+/**
+ * The vendor's own model card, where it is known and a catalog is wrong.
+ *
+ * This outranks every catalog, including OpenRouter. The reasoning is specific:
+ * a catalog records what a RESELLER believes a model accepts, while the model
+ * card records what the model itself implements. When those disagree the
+ * catalog is usually not lying — it is describing the gateway's shape. EnClave
+ * accepts all six effort values for `glm-5.3`; the card says the model only
+ * implements low, high and max. The extra values are accepted and then ignored,
+ * which is worse than not offering them: Pi would show a thinking level that
+ * silently does nothing.
+ *
+ * Every entry here is a transcription of a published card, not an inference, and
+ * carries the reason it exists. `null` in a thinking map means the level is not
+ * supported; `off: null` means thinking cannot be switched off.
+ */
+export interface VendorSpec {
+  input?: Array<"text" | "image">;
+  maxTokens?: number;
+  thinkingLevelMap?: Record<string, string | null>;
+  /** Why this entry exists, so a future reader can check it. */
+  why: string;
+}
+
+export const VENDOR_SPEC: Record<string, VendorSpec> = {
+  "glm-5.3": {
+    input: ["text"],
+    maxTokens: 131_072,
+    thinkingLevelMap: { off: null, minimal: null, low: "low", medium: null, high: "high", xhigh: null, max: "max" },
+    why: "GLM-5.3 model card: no vision/audio/video, reasoning low|high|max, context 1M, max output 128K. OpenRouter declares 943718 and all six levels; the endpoint accepts both, and simply ignores the levels the card does not list.",
+  },
+  "glm-5.2": {
+    input: ["text"],
+    maxTokens: 131_072,
+    thinkingLevelMap: { off: null, minimal: null, low: null, medium: null, high: "high", xhigh: null, max: "max" },
+    why: "GLM-5.2 model card: no vision/audio/video, reasoning high|max, context 1M, max output 128K. OpenRouter declares 943718 and all six levels; same reason as glm-5.3.",
+  },
+};
+
 export interface Resolved {
   entry: ModelEntry;
   /** The source that supplied the values, if any. */
   source?: string;
   /** Every other provider that also knows this model: corroboration only. */
   corroborating: string[];
-  rule: "kept" | "exact" | "corroborated" | "none";
+  rule: "vendor" | "donated" | "kept" | "corroborated" | "none";
+  /** The exact id in the donor catalog that matched, prefix included. */
+  matchedId?: string;
 }
 
 const withinTolerance = (a: number, b: number) =>
@@ -420,47 +475,55 @@ export function resolveModel(
     .map((c) => {
       for (const name of candidates) {
         const entry = c.models.get(name);
-        if (entry) return { provider: c.provider, entry };
+        if (entry) return { provider: c.provider, entry, matchedId: entry.id };
       }
       return undefined;
     })
-    .filter((h): h is { provider: string; entry: ModelEntry } => h !== undefined);
+    .filter((h): h is { provider: string; entry: ModelEntry; matchedId: string } => h !== undefined);
 
-  // 1. Values already written are specific to this endpoint, so they stand. A
-  //    bundled figure only takes over inside the rounding band, and only for
-  //    fields a donor may touch, which excludes `compat`.
-  if (kept) {
-    const entry = copyFields(kept, HAND_FIELDS);
-    for (const { entry: b } of knowing) {
-      for (const field of BUNDLED_FIELDS) {
-        const bundledValue = b[field];
-        if (bundledValue === undefined) continue;
-        const keptValue = entry[field];
-        if (keptValue === undefined) {
-          (entry as Record<string, unknown>)[field] = bundledValue;
-          continue;
-        }
-        if (typeof keptValue === "number" && typeof bundledValue === "number" && withinTolerance(keptValue, bundledValue)) {
-          (entry as Record<string, unknown>)[field] = bundledValue;
-        }
-      }
-    }
+  // The primary donor is whichever catalog ranks first in PROVIDER_PRIORITY.
+  const primary = bundled.length ? bundled[0].provider : undefined;
+  const donor = knowing.find((h) => h.provider === primary) ?? knowing[0];
+  const corroborating = knowing.filter((h) => h.provider !== donor?.provider).map((h) => h.provider);
+
+  // 1. The vendor's own card, where one exists. Nothing outranks the model
+  //    card about the model.
+  const spec = VENDOR_SPEC[bare];
+  if (spec) {
+    const entry: ModelEntry = donor ? copyFields(donor.entry, BUNDLED_FIELDS) : {};
+    if (spec.input) entry.input = spec.input;
+    if (spec.maxTokens !== undefined) entry.maxTokens = spec.maxTokens;
+    if (spec.thinkingLevelMap) entry.thinkingLevelMap = spec.thinkingLevelMap as ThinkingLevelMap;
+    if (!donor && kept) for (const f of HAND_FIELDS) if (kept[f] !== undefined) (entry as Record<string, unknown>)[f] = kept[f];
     return {
       entry,
-      source: "models.json",
-      corroborating: knowing.map((h) => h.provider),
-      rule: knowing.length ? "corroborated" : "kept",
+      source: "model card",
+      matchedId: donor?.matchedId,
+      corroborating: corroborating.concat(donor ? [donor.provider] : []),
+      rule: "vendor",
     };
   }
 
-  // 2. Nothing written yet: the highest-priority catalog that knows the model.
-  if (knowing.length) {
-    const [first, ...rest] = knowing;
+  // 2. The primary donor decides every field it knows. It is a catalog whose
+  //    whole business is routing these models.
+  if (donor) {
     return {
-      entry: copyFields(first.entry, BUNDLED_FIELDS),
-      source: first.provider,
-      corroborating: rest.map((h) => h.provider),
-      rule: "exact",
+      entry: copyFields(donor.entry, BUNDLED_FIELDS),
+      source: donor.provider,
+      matchedId: donor.matchedId,
+      corroborating,
+      rule: corroborating.length ? "corroborated" : "donated",
+    };
+  }
+
+  // 3. No donor knows this model: what is already written stands. It may be a
+  //    value measured against this endpoint, which no catalog can beat.
+  if (kept) {
+    return {
+      entry: copyFields(kept, HAND_FIELDS),
+      source: "models.json",
+      corroborating: [],
+      rule: "kept",
     };
   }
 

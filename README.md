@@ -106,8 +106,29 @@ There are two kinds, and they are not equal in authority.
 ### The order
 
 ```
-what is already in models.json  >  openrouter  >  the rest of Pi's catalogs
+the vendor's own model card  >  openrouter  >  the rest of Pi's catalogs
+what is already in models.json is the fallback, used only when no catalog
+knows the model at all.
 ```
+
+**Nothing outranks the model card.** A catalog records what a *reseller*
+believes a model accepts; the card records what the model *implements*. When
+they disagree the catalog is usually not lying — it is describing the gateway's
+shape. EnClave accepts all six effort values for `glm-5.3`; the card says the
+model only implements low, high and max. The extra values are accepted and then
+ignored, which is worse than not offering them: Pi would show a thinking level
+that silently does nothing. Same for the ceiling — OpenRouter declares 943,718
+and this endpoint rejects it outright.
+
+Cards are recorded in `VENDOR_SPEC` in `donors.ts`, each entry carrying the
+reason it exists so a later reader can check it:
+
+| Model | Card says | OpenRouter says |
+|---|---|---|
+| `glm-5.3` | 131 072 out, low/high/max, text only | 943 718 out, six levels |
+| `glm-5.2` | 131 072 out, high/max, text only | 943 718 out, six levels |
+
+Everything else falls through to the order below.
 
 There is **no hand-written donor**, and none is required. Two reasons:
 
