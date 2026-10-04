@@ -45,5 +45,8 @@
   "homepage": "https://pi.dev/packages/@lokeraar/pi-enclave-bridge",
   "scripts": {
     "test": "node --experimental-strip-types scripts/test-sync.mjs"
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }
