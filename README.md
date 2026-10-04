@@ -5,6 +5,10 @@ EnClave provider for [Pi](https://pi.dev). The live router catalog shows up in
 the router's task aliases** — resolved from the model catalog Pi already ships,
 with no extra account required.
 
+<a href="https://github.com/Gentleman-Programming/gentle-ai">
+  <img width="220" src="https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/docs/assets/brand/built-with-gentle-ai.png" alt="Built with Gentle-AI" />
+</a>
+
 ## ⚡ Quick Start
 
 ```bash
