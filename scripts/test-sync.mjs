@@ -129,17 +129,28 @@ console.log("\nthe catalog is found without a stored path");
   };
   mk("0.85.1", "old", 100);
   mk("0.99.0", "new", 999);
-  mk("0.90.0", "plusbuild", 500);
+  mk("0.90.0+dev", "plusbuild", 500);
+
+  // The Pi install is found by an absolute prefix and would shadow the store, so
+  // the preference order is exercised on the store scanner directly.
+  const { storeCatalogs } = await import(join(ROOT, "donors.ts"));
+  const dirs = storeCatalogs(fake);
+  check("store catalogs are found without a stored path", dirs.length >= 1, String(dirs.length));
+  check("the newest version wins whatever the folder is called", dirs[0].includes("0.99.0"), dirs[0]);
+  const cat2 = readBundledCatalog(dirs[0], "openrouter");
+  check("the newest catalog is the one read", cat2.models.get("glm-5.3").maxTokens === 999, String(cat2.models.get("glm-5.3").maxTokens));
+  check("a + prerelease is never preferred", !dirs.some((d) => d.includes("0.90.0+dev")), dirs.join(","));
 
   const locs = findBundledCatalogs(fake);
-  check("catalogues are found without a stored path", locs.length >= 1, String(locs.length));
-  check("the newest version wins whatever the folder is called", locs[0].dir.includes("0.99.0"), locs[0].dir);
-  const cat2 = readBundledCatalog(locs[0].dir, "openrouter");
-  check("the newest catalog is the one read", cat2.models.get("glm-5.3").maxTokens === 999, String(cat2.models.get("glm-5.3").maxTokens));
-  check("a + build is never preferred", !locs[0].dir.includes("plusbuild"), locs[0].dir);
+  check("the Pi install is preferred over the store", locs[0].origin === "la que usa Pi", locs[0].origin);
   rmSync(fake, { recursive: true, force: true });
 
-  check("a missing package degrades instead of throwing", findBundledCatalogs("/no/existe/path").length === 0);
+  // A bogus agentDir must not throw. The Pi install is found by an absolute
+  // prefix, so it can still be returned here; what matters is that nothing
+  // breaks and the store scan contributes nothing.
+  const bogus = findBundledCatalogs("/no/existe/path");
+  check("a bogus agent dir does not throw", Array.isArray(bogus), typeof bogus);
+  check("and contributes no store catalog", !bogus.some((b) => b.origin === "pi install"));
 }
 
 console.log("\nthe block: matching, near misses, endpoint-owned fields");

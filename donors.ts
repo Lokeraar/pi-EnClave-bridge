@@ -51,7 +51,6 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { createRequire } from "node:module";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
@@ -143,20 +142,40 @@ function catalogAt(piAiPackage: string): string | undefined {
   return undefined;
 }
 
-/** Where the Pi package itself may live. Only used to resolve pi-ai. */
+/**
+ * Where the Pi package itself may live. Only used to resolve pi-ai.
+ *
+ * The prefix is derived from `process.execPath` rather than assumed: on Termux
+ * it is `/data/data/com.termux/files/usr`, not `/usr`, so a hardcoded `/usr/lib`
+ * silently never matches. Getting this wrong does not throw — it just sends the
+ * lookup to the wrong copy of the catalog.
+ */
 function piPackageCandidates(): string[] {
-  const out = [
-    // Resolved from this process, which is Pi's own bundle when Pi loads us.
-    fileURLToPath(new URL("..", import.meta.url)),
-    "/usr/lib/node_modules/@earendil-works/pi-coding-agent",
-    "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent",
-  ];
+  const out: string[] = [];
+  const add = (base: string) => {
+    const p = resolve(base, "@earendil-works", "pi-coding-agent");
+    try {
+      if (statSync(p).isDirectory()) out.push(p);
+    } catch {
+      // not here
+    }
+  };
+
+  // The install this module lives under, when Pi loads it from its own bundle.
+  add(dirname(fileURLToPath(import.meta.url)) + "/..");
+
+  // The global prefix this node was installed under.
   try {
-    out.push(dirname(dirname(process.execPath)) + "/../lib/node_modules/@earendil-works/pi-coding-agent");
+    add(dirname(dirname(process.execPath)) + "/lib/node_modules");
   } catch {
     // execPath unavailable
   }
-  return [...new Set(out.map((p) => resolve(p)))];
+
+  // Conventional prefixes, only used where they actually exist.
+  add("/usr/local/lib/node_modules");
+  add("/usr/lib/node_modules");
+
+  return [...new Set(out)];
 }
 
 /**
@@ -185,43 +204,50 @@ export function findBundledCatalogs(agentDir: string): CatalogLocation[] {
     if (dir && !found.some((f) => f.dir === dir)) found.push({ dir, origin });
   };
 
+  // Walking the tree by hand rather than using module resolution: pi-ai is
+  // ESM-only with an `exports` map that exposes neither a main nor its own
+  // package.json, so require.resolve fails on it with
+  // ERR_PACKAGE_PATH_NOT_EXPORTED. The directory is right there next to Pi, so
+  // looking for it directly is both simpler and immune to that.
   for (const piPkg of piPackageCandidates()) {
-    try {
-      const require = createRequire(join(piPkg, "package.json"));
-      push(catalogAt(require.resolve("@earendil-works/pi-ai/package.json")), "la que usa Pi");
-    } catch {
-      // Pi does not resolve pi-ai from here.
-    }
+    push(catalogAt(join(piPkg, "node_modules", "@earendil-works", "pi-ai", "package.json")), "la que usa Pi");
   }
 
+  for (const dir of storeCatalogs(agentDir)) push(dir, "pi install");
+  return found;
+}
+
+/**
+ * Every usable copy in the agent's pnpm store, best first.
+ *
+ * When several versions sit there the newest wins, and a `+` build never does —
+ * a prerelease is never the one a released Pi runs. Exported separately so the
+ * preference order can be tested without the Pi install shadowing it.
+ */
+export function storeCatalogs(agentDir: string): string[] {
   const store = join(agentDir, "npm", "node_modules", ".pnpm");
   let entries: string[] = [];
   try {
     entries = readdirSync(store).filter((e) => e.startsWith("@earendil-works+pi-ai@"));
   } catch {
-    entries = [];
+    return [];
   }
-  const piVersion = piPackageVersion();
+  const out: string[] = [];
   entries
     .map((e) => ({ entry: e, version: e.slice("@earendil-works+pi-ai@".length).split("_")[0] }))
     .filter((c) => !c.version.includes("+"))
-    .sort((a, b) => {
-      if (piVersion && a.version === piVersion) return -1;
-      if (piVersion && b.version === piVersion) return 1;
-      return compareVersions(b.version, a.version);
-    })
+    .sort((a, b) => compareVersions(b.version, a.version))
     .forEach((c) => {
-      try {
-        push(catalogAt(join(store, c.entry, "node_modules", "@earendil-works", "pi-ai", "package.json")), "pi install");
-      } catch {
-        // not a usable copy
-      }
+      const dir = catalogAt(join(store, c.entry, "node_modules", "@earendil-works", "pi-ai", "package.json"));
+      if (dir) out.push(dir);
     });
-
-  return found;
+  return out;
 }
 
-function piPackageVersion(): string | undefined {
+/** Pi's own version, for the report only. Note this is NOT pi-ai's version:
+ *  the two use independent numbering (1.0.0 vs 0.85.1), so they never match and
+ *  must not be compared. */
+export function piPackageVersion(): string | undefined {
   for (const piPkg of piPackageCandidates()) {
     try {
       const pkg = JSON.parse(readFileSync(join(piPkg, "package.json"), "utf8")) as { version?: string };
