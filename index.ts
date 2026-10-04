@@ -1,65 +1,47 @@
 /**
- * @lokeraar/pi-enclave-bridge — EnClave provider for Pi: registration + live
- * catalog wiring.
+ * @lokeraar/pi-enclave-bridge — EnClave provider for Pi.
  *
- * EnClave's router (https://router.enclave.ai/v1) speaks the OpenRouter catalog
- * dialect and, unlike most gateways, DECLARES the values a coding agent needs:
- * a real `context_length` per model, real `pricing` in USD per 1M tokens, and
- * per-key routability. So this bridge does not re-derive those by probing — it
- * trusts them and labels them `gateway`. What the endpoint says nothing about is
- * reasoning effort levels and the output ceiling, and only those get probed.
+ * The values live in `models.json` under `providers.EnClave`. This file only
+ * registers the provider and keeps its model list in step with the endpoint.
  *
- * Every published model carries a `provenance` block saying where each field
- * came from, so "is this value real?" is answerable without trusting the bridge:
+ * Two scripts own the data:
  *
- *   measured          — a request was made and the answer observed
- *   gateway           — the endpoint's own claim (context, price, modality)
- *   curated           — hand-written in enclave-curated.json
- *   vanilla           — a conservative default because nothing better existed
+ *   scripts/sync-models.mjs  rebuilds the EnClave block: reads the live
+ *                            catalog, copies values from the `opendesign`
+ *                            donor by bare model name, keeps the endpoint's own
+ *                            context window and price, and drops models that do
+ *                            not answer. Run it after changing the donor.
  *
- * Two retirement signals keep the catalog honest, both recorded in
- * `<agentDir>/enclave-retired.json`:
- *   not-listed    — a successful fetch stopped listing the id
- *   not-routable  — the id is listed but `routeable_endpoint_count` is 0 for
- *                   this key, so every request would 404
+ *   scripts/probe-models.mjs optional; measures reasoning levels and output
+ *                            ceilings for models with no donor, so the "work by
+ *                            hand" list has somewhere to go.
  *
- * Router aliases (`cyberouter/auto` plus one per security task) are published
- * too. They live in a sibling field of the catalog, not inside `data`, and are
- * easy to lose.
- *
- * Kill switch: PI_ENCLAVE_LIVE=0.   Maintenance audit: PI_ENCLAVE_REPROBE=1.
+ * Local install: copy `index.ts` and `enclave-live.ts` into
+ * `~/.pi/agent/extensions/`, renaming `index.ts` to `enclave-bridge.ts`. Pi
+ * loads every `extensions/*.ts` as a factory, so a file called `index.ts`
+ * collides and registers the provider twice.
  */
 
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
-  buildStaticCatalog,
   ENCLAVE_BASE_URL,
   makeRefreshModels,
+  providerModels,
+  readModelsJson,
   PROVIDER_ID,
 } from "./enclave-live.ts";
 
 export default async function (pi: ExtensionAPI) {
   const agentDir = getAgentDir();
+  const cfg = readModelsJson(agentDir).providers?.[PROVIDER_ID] ?? {};
+  const baseUrl = (cfg.baseUrl as string) ?? ENCLAVE_BASE_URL;
 
-  // The baked snapshot is registered eagerly so startup resolves before any
-  // network call. It is built through the SAME funnel a refresh uses, so the
-  // statically registered list carries the retirement ledger and the donor just
-  // like the live one. Skipping either layer here is not a cosmetic difference:
-  // `pi --list-models` never touches the network, so this list is what a reader
-  // actually sees, and it was showing vanilla max-out and no images for models
-  // whose live values were inherited.
-  const models = buildStaticCatalog(agentDir);
-
-  // Registration is unconditional: this bridge owns the EnClave provider and
-  // replaces whatever `models.json` declares for it. The baked snapshot is what
-  // makes startup work before any network call — the live layer replaces it with
-  // gateway-sourced values (and real prices) as soon as a fetch succeeds.
   pi.registerProvider(PROVIDER_ID, {
-    name: "EnClave",
-    api: "openai-completions",
-    baseUrl: ENCLAVE_BASE_URL,
-    authHeader: true,
-    models,
-    refreshModels: makeRefreshModels({ agentDir, fallbackBaseUrl: ENCLAVE_BASE_URL }),
+    name: (cfg.name as string) ?? "EnClave",
+    api: (cfg.api as string) ?? "openai-completions",
+    baseUrl,
+    authHeader: cfg.authHeader !== false,
+    models: providerModels(readModelsJson(agentDir), PROVIDER_ID),
+    refreshModels: makeRefreshModels(agentDir, baseUrl),
   });
 }

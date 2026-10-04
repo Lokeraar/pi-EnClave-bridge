@@ -1,657 +1,128 @@
 /**
- * enclave-live.ts — the catalog engine for the EnClave provider bridge.
+ * enclave-live.ts — the small shared core for the EnClave bridge.
  *
- * ## Why this file is not a copy of `opendesign-live.ts`
+ * Values live in `models.json` (`providers.EnClave.models`), written by
+ * `scripts/sync-models.mjs`. This module exists so the script and the extension
+ * agree on one definition of "a model" and one definition of "where do values
+ * come from". Nothing is computed here at runtime except membership.
  *
- * The two gateways differ in a way that changes the whole design:
+ * Value precedence, applied by the sync script:
  *
- * - OpenDesign's `/models` returns ids and almost nothing else. Every value a
- *   user cares about has to be discovered by probing, which is why that bridge
- *   probes aggressively and treats `context_window` as unmeasurable.
- * - EnClave's `/models` returns an OpenRouter-shaped catalog that already
- *   DECLARES `context_length`, `pricing` and per-key routability. Probing those
- *   again would waste money and produce weaker evidence than the endpoint's own
- *   claim. What EnClave says *nothing* about is reasoning effort levels and the
- *   output ceiling — exactly what still needs probing.
+ *   1. DONOR — `providers.opendesign` in the same models.json, matched on the
+ *      bare model name (the id with any `vendor/` prefix stripped on both
+ *      sides). The donor is the source of truth. Its numbers are copied as-is,
+ *      even when they are larger than what a local measurement found: a value
+ *      the user chose beats one this tool inferred. Lower it deliberately if a
+ *      problem ever shows up, not preemptively.
+ *   2. EXISTING — whatever the EnClave entry already says. This is where
+ *      hand-measured values live, and for models with no donor it is the only
+ *      source. Copying is deliberately not additive: the donor replaces the
+ *      block, so there is no leftover hybrid.
+ *   3. GATEWAY — `context_length` and `pricing` only, because those are facts
+ *      about this endpoint and the donor has no opinion on them.
  *
- * So the rule here is inverted relative to the sibling bridge: trust the
- * gateway wherever it speaks, probe only where it is silent, and label every
- * value with where it came from so a reader never has to guess.
+ * `cost` is always the gateway's: the donor carries no price, so inheriting it
+ * would publish every model as free.
  *
- * ## The two retirement signals
- *
- * OpenDesign only had one ("the endpoint stopped listing it"). EnClave has two,
- * and the second one is easy to miss:
- *
- * 1. `not-listed`   — a successful fetch did not return the id.
- * 2. `not-routable` — the id IS listed, but `routeable_endpoint_count` is 0 for
- *    this key. The router fails closed and every request 404s with
- *    "No routeable endpoint matched filters (healthy, zdr, data_collection)".
- *    Publishing such a model is the exact ghost-model bug the ledger exists to
- *    prevent: it looks selectable and fails 100% of the time.
- *
- * ## Aliases
- *
- * The catalog has a sibling field `aliases` (NOT inside `data`) holding five
- * router pseudo-models: `cyberouter/auto` plus one per security task
- * (`vuln-discovery`, `exploit-dev`, `remediation`, `triage`), each sorted by
- * `task_perf`. A parser that only reads `data` silently loses all five.
- *
- * They are usable as a `model` value but have no context window and no price of
- * their own — both depend on which concrete model the router picks per request.
- * We bound them instead of guessing: the SMALLEST context window in the catalog
- * (the guaranteed floor, since some routed model may be the narrow one) and the
- * LARGEST price in the catalog (an upper bound, because understating what a
- * call will cost is worse than overstating it). That asymmetry is deliberate:
- * capability fields are biased low, money fields are biased high.
+ * Membership comes from the live catalog. A model is published only if the
+ * catalog lists it AND `routeable_endpoint_count > 0` — an id with no healthy
+ * route for this key is not something the picker should offer.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 
-/**
- * Where each value came from.
- *
- * - `curated`  — hand-written in the curated file / baked snapshot. Trusted,
- *                never overwritten by the live layer.
- * - `measured` — a real probe: the request was made and the answer observed.
- * - `gateway`  — the endpoint's own declaration. Real, but a CLAIM.
- * - `vanilla`  — a conservative default used because nothing better was
- *                available. Honest, but not evidence.
- * - `inherited`— borrowed from another provider's curated layer for the same
- *                base model. Real evidence about the MODEL, but measured on a
- *                DIFFERENT gateway, so it is a prior and not a measurement
- *                here. Re-probe with `--all` when the chat endpoint answers.
- */
-export type ValueOrigin = "curated" | "measured" | "gateway" | "vanilla" | "inherited";
-
-export interface ValueProvenance {
-  contextWindow: ValueOrigin;
-  maxTokens: ValueOrigin;
-  thinkingLevelMap: ValueOrigin;
-  input: ValueOrigin;
-  cost: ValueOrigin;
-}
-
-export interface LiveModelConfig {
+export interface ModelEntry {
   id: string;
-  name: string;
+  name?: string;
   api?: string;
   provider?: string;
-  baseUrl?: string;
-  reasoning: boolean;
+  reasoning?: boolean;
   thinkingLevelMap?: ThinkingLevelMap;
-  input: Array<"text" | "image">;
-  cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
-  contextWindow: number;
-  maxTokens: number;
+  input?: Array<"text" | "image">;
+  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
+  contextWindow?: number;
+  maxTokens?: number;
   compat?: Record<string, unknown>;
-  /** `cyberouter/auto` and friends are router pseudo-models, not fixed weights. */
-  alias?: { task: string | null; sort?: string };
-  metadata?: Record<string, unknown>;
-  provenance?: ValueProvenance;
   [key: string]: unknown;
 }
-
-/** Structural mirror of pi-ai's RefreshModelsContext. */
-export interface RefreshModelsContextLike {
-  credential?: { type?: string; key?: string };
-  stored?: {
-    models?: readonly LiveModelConfig[];
-    checkedAt?: number;
-    etag?: string;
-    lastModified?: number;
-  };
-  publish(publication: {
-    persist?: { models: LiveModelConfig[]; checkedAt?: number } | null;
-    update?: () => void;
-  }): Promise<boolean>;
-  allowNetwork: boolean;
-  force?: boolean;
-  signal: AbortSignal;
-}
-
-export interface ModelsJsonProviderLike {
-  baseUrl?: string;
-  compat?: Record<string, unknown>;
-  models?: LiveModelConfig[];
-}
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
 
 export const ENCLAVE_BASE_URL = "https://router.enclave.ai/v1";
 export const PROVIDER_ID = "EnClave";
 
-export const THINKING_LEVELS: Array<Exclude<ThinkingLevel, "off">> = [
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-];
+/** Fields copied from the donor. Deliberately not cost, and not the id. */
+const DONOR_FIELDS = [
+  "reasoning",
+  "thinkingLevelMap",
+  "input",
+  "contextWindow",
+  "maxTokens",
+  "compat",
+] as const;
 
-/**
- * Conservative default: only `medium` is offered.
- *
- * `getSupportedThinkingLevels` drops any level mapped to `null` and keeps
- * `xhigh`/`max` only when the key is present at all, so this map reduces the UI
- * to a single safe level instead of guessing. It is `vanilla`, never `measured`.
- */
-const VANILLA_THINKING_MAP: ThinkingLevelMap = {
-  off: null,
-  minimal: null,
-  low: null,
-  medium: "medium",
-  high: null,
-  xhigh: null,
-  max: null,
-};
-
-/** Ascending output-cap candidates; the walk stops at the first rejection. */
-const CEILING_CANDIDATES = [
-  8_192, 32_768, 131_072, 262_144, 393_216, 524_288, 1_048_576, 2_097_152,
-];
-
-const PROBE_BODY_MESSAGES = [
-  { role: "system", content: "Be terse." },
-  { role: "user", content: "hi" },
-];
-
-/** Consecutive non-measurement probe failures before probing is abandoned. */
-const PROBE_FAILURE_LIMIT = 3;
-
-/** Non-chat ids the picker must never see. */
-const NOISE_PATTERN =
-  /\b(embed|embedding|tts|whisper|dall-?e|clip|moderation|rerank|reranker)\b|^image[-_]|[-_]embed/i;
-
-// ---------------------------------------------------------------------------
-// Baked snapshot (registration-time fallback; the live layer replaces it)
-// ---------------------------------------------------------------------------
-
-/**
- * A snapshot of the catalog observed on 2026-10-03 (14 models, 2 retired, + 5 aliases), so `findInitialModel()` can
- * resolve during startup before any network call happens. Every value here is
- * `curated` — it is a transcription of one observation, not a live fact. The
- * live layer overwrites it as soon as a fetch succeeds.
- */
-export const SNAPSHOT_MODELS: LiveModelConfig[] = [
-  {
-    id: "cyberouter/glm-5.3",
-    name: "GLM 5.3",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 1048576,
-    maxTokens: 16384,
-    cost: { input: 1.4, output: 4.4, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "glm-5", creator: "Zhipu (open weight; hosted US/EU only)", endpointCount: 3, routeableEndpointCount: 3 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/glm-5.3-flash",
-    name: "GLM 5.3 Flash",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 1048576,
-    maxTokens: 16384,
-    cost: { input: 0.15, output: 0.5, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "glm-5", creator: "Zhipu (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 2 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/glm-5.2",
-    name: "GLM 5.2",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 1048576,
-    maxTokens: 16384,
-    cost: { input: 1.4, output: 4.4, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "glm-5", creator: "Zhipu (open weight; hosted US/EU only)", endpointCount: 3, routeableEndpointCount: 3 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/deepseek-v4-pro",
-    name: "DeepSeek V4 Pro",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 1048576,
-    maxTokens: 16384,
-    cost: { input: 1.32, output: 3.96, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "deepseek-v4", creator: "DeepSeek (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 2 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/deepseek-v4.1-flash",
-    name: "DeepSeek V4.1 Flash",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 1048576,
-    maxTokens: 16384,
-    cost: { input: 0.3, output: 1.2, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "deepseek-v4.1", creator: "DeepSeek (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 2 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/deepseek-v4-flash",
-    name: "DeepSeek V4 Flash",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 1048576,
-    maxTokens: 16384,
-    cost: { input: 0.13, output: 0.26, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "deepseek-v4", creator: "DeepSeek (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 2 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/qwen3.8-max",
-    name: "Qwen3.8 Max",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 1010000,
-    maxTokens: 16384,
-    cost: { input: 2, output: 6, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "qwen3.8", creator: "Alibaba (open weight; hosted US/EU only)", endpointCount: 1, routeableEndpointCount: 1 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/kimi-k3",
-    name: "Kimi K3",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 1048576,
-    maxTokens: 16384,
-    cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "kimi-k3", creator: "Moonshot (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 2 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/gpt-oss-120b",
-    name: "GPT-OSS 120B",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 131072,
-    maxTokens: 16384,
-    cost: { input: 0.1, output: 0.5, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "gpt-oss", creator: "OpenAI (open weight)", endpointCount: 2, routeableEndpointCount: 2 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/minimax-m3",
-    name: "MiniMax M3",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 524288,
-    maxTokens: 16384,
-    cost: { input: 0.3, output: 1.2, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "minimax-m3", creator: "MiniMax (open weight; hosted US/EU only)", endpointCount: 1, routeableEndpointCount: 1 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/nemotron-ultra",
-    name: "Nemotron 3 Ultra",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 262144,
-    maxTokens: 16384,
-    cost: { input: 0.6, output: 2.4, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "nemotron", creator: "NVIDIA", endpointCount: 2, routeableEndpointCount: 1 },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "gateway",
-      cost: "gateway",
-    },
-  },
-];
-
-/** Same idea for aliases, filled in by the same snapshot step. */
-export const SNAPSHOT_ALIAS_MODELS: LiveModelConfig[] = [
-  {
-    id: "cyberouter/auto",
-    name: "cyberouter/auto",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 131072,
-    maxTokens: 16384,
-    cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    alias: { task: null, sort: "task_perf" },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "vanilla",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/vuln-discovery",
-    name: "cyberouter/vuln-discovery",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 131072,
-    maxTokens: 16384,
-    cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    alias: { task: "vuln_discovery", sort: "task_perf" },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "vanilla",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/exploit-dev",
-    name: "cyberouter/exploit-dev",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 131072,
-    maxTokens: 16384,
-    cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    alias: { task: "exploit_dev", sort: "task_perf" },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "vanilla",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/remediation",
-    name: "cyberouter/remediation",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 131072,
-    maxTokens: 16384,
-    cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    alias: { task: "remediation", sort: "task_perf" },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "vanilla",
-      cost: "gateway",
-    },
-  },
-  {
-    id: "cyberouter/triage",
-    name: "cyberouter/triage",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 131072,
-    maxTokens: 16384,
-    cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    alias: { task: "triage", sort: "task_perf" },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "vanilla",
-      cost: "gateway",
-    },
-  },
-];
-
-// ---------------------------------------------------------------------------
-// normalize
-// ---------------------------------------------------------------------------
-
-function normalize(m: LiveModelConfig): LiveModelConfig {
-  const mergedCompat = {
-    supportsDeveloperRole: false,
-    ...(m.compat ?? {}),
-  };
-  // Invariant: only hand-written entries reach here without provenance — the
-  // curated file and the baked snapshot. Probe-built, gateway-built and stored
-  // entries all carry it forward via the spread. So absent ⇒ curated.
-  const provenance: ValueProvenance = m.provenance ?? {
-    contextWindow: "curated",
-    maxTokens: "curated",
-    thinkingLevelMap: "curated",
-    input: "curated",
-    cost: "curated",
-  };
-  return {
-    ...m,
-    name: m.name ?? m.id,
-    api: m.api ?? "openai-completions",
-    provider: PROVIDER_ID,
-    reasoning: m.reasoning ?? true,
-    input: m.input && m.input.length ? m.input : ["text"],
-    cost: m.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-    contextWindow: m.contextWindow && m.contextWindow > 0 ? m.contextWindow : 128_000,
-    maxTokens: m.maxTokens && m.maxTokens > 0 ? m.maxTokens : 16_384,
-    compat: mergedCompat,
-    provenance,
-  };
+/** The model name with any `vendor/` prefix removed, on either side. */
+export function bareName(id: string): string {
+  const i = id.lastIndexOf("/");
+  return i === -1 ? id : id.slice(i + 1);
 }
 
 // ---------------------------------------------------------------------------
-// HTTP
+// models.json
 // ---------------------------------------------------------------------------
 
-interface ProbeResult {
-  ok: boolean;
-  /** reasoning tokens reported by usage, when the upstream reports them */
-  rt?: number;
-  status?: number;
-  /** transport-level failure (timeout/conn/abort), not an HTTP rejection */
-  net?: boolean;
-  /** truncated error body — the gateway tunnels the upstream status in here */
-  body?: string;
+export interface ModelsJson {
+  providers?: Record<string, Record<string, unknown> & { models?: ModelEntry[] }>;
 }
 
-async function postChat(
-  baseUrl: string,
-  key: string,
-  body: Record<string, unknown>,
-  signal: AbortSignal,
-  timeoutMs = 20_000,
-): Promise<ProbeResult> {
-  if (signal.aborted) return { ok: false, net: true };
-  try {
-    const res = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]),
-    });
-    if (!res.ok) {
-      let body = "";
-      try {
-        body = (await res.text()).slice(0, 400);
-      } catch {
-        /* body is best-effort; classification falls back to the status alone */
-      }
-      return { ok: false, status: res.status, body };
-    }
-    const json = (await res.json()) as {
-      usage?: { completion_tokens_details?: { reasoning_tokens?: number } };
-    };
-    const rt = json?.usage?.completion_tokens_details?.reasoning_tokens;
-    return { ok: true, rt: typeof rt === "number" ? rt : undefined };
-  } catch {
-    return { ok: false, net: true };
+export function readModelsJson(agentDir: string): ModelsJson {
+  return JSON.parse(readFileSync(join(agentDir, "models.json"), "utf8")) as ModelsJson;
+}
+
+export function writeModelsJson(agentDir: string, data: ModelsJson): void {
+  writeFileSync(join(agentDir, "models.json"), `${JSON.stringify(data, null, 2)}\n`);
+}
+
+export function providerModels(data: ModelsJson, provider: string): ModelEntry[] {
+  return data.providers?.[provider]?.models ?? [];
+}
+
+/** bare name -> donor entry. First definition wins. */
+export function donorIndex(data: ModelsJson, provider = "opendesign"): Map<string, ModelEntry> {
+  const index = new Map<string, ModelEntry>();
+  for (const m of providerModels(data, provider)) {
+    const bare = bareName(m.id);
+    if (!index.has(bare)) index.set(bare, m);
   }
-}
-
-/**
- * The only HTTP statuses that constitute a per-parameter MEASUREMENT.
- *
- * Everything else is a request-level failure that says nothing about the model:
- * 402 quota exhausted, 401/403 auth, 404 no route, 429 rate limit, 5xx, and
- * transport errors. Deriving values from those is how a probe concludes "this
- * model has no reasoning and a 16k ceiling" while the account simply cannot pay
- * or the router is down — which is precisely the state EnClave's chat endpoint
- * is in today (Vercel 500 on every model).
- */
-/**
- * Classify a failed probe call.
- *
- * The subtlety this exists for: EnClave's router is a TUNNEL. When the
- * upstream inference provider rejects a parameter, the router answers `502`
- * with a body reading `"Inference provider returned HTTP 400"`. That is
- * semantically a parameter rejection wearing a 5xx costume, and treating the
- * status alone as "not a measurement" would discard an otherwise valid
- * measurement and lose the real output ceiling.
- *
- * So when the body carries an upstream status, that status is what counts:
- *   400/422 upstream → parameter rejection (the model refused this shape)
- *   410         upstream → the upstream resource is GONE (a retirement signal,
- *                      and a permanent HTTP semantic rather than a blip)
- *
- * Everything else stays non-measurement: quota (402), auth (401/403), no
- * route (404), rate limit (429), bare 5xx and transport errors.
- */
-type FailureKind = "parameter" | "upstream-gone" | "no-route" | "other";
-
-const UPSTREAM_STATUS = /returned HTTP (\d{3})/i;
-
-function classifyFailure(status: number | undefined, body?: string): FailureKind {
-  if (status === 404) return "no-route";
-  const m = UPSTREAM_STATUS.exec(body ?? "");
-  if (m) {
-    const upstream = Number(m[1]);
-    if (upstream === 400 || upstream === 422) return "parameter";
-    if (upstream === 410) return "upstream-gone";
-    return "other";
-  }
-  return status === 400 || status === 422 ? "parameter" : "other";
-}
-
-function isParameterRejection(r: { status?: number; body?: string }): boolean {
-  return classifyFailure(r.status, r.body) === "parameter";
+  return index;
 }
 
 // ---------------------------------------------------------------------------
-// Catalog fetch
+// Live catalog
 // ---------------------------------------------------------------------------
 
-export interface GatewayModel {
+export interface CatalogModel {
   id: string;
   name?: string;
   contextLength?: number;
   pricingPrompt?: number;
   pricingCompletion?: number;
-  /** false when `routeable_endpoint_count` is 0 for this key */
   routeable: boolean;
-  routeableCount?: number;
-  endpointCount?: number;
-  modality?: string;
-  toolCapable?: boolean;
-  openWeight?: boolean;
-  family?: string;
-  creator?: string;
-  tasks?: string[];
 }
 
-export interface GatewayAlias {
+export interface CatalogAlias {
   id: string;
   task: string | null;
-  sort?: string;
 }
 
 export interface LiveCatalog {
-  models: GatewayModel[];
-  aliases: GatewayAlias[];
+  models: CatalogModel[];
+  aliases: CatalogAlias[];
 }
 
-function num(v: unknown): number | undefined {
-  return typeof v === "number" && Number.isFinite(v) && v > 0 ? v : undefined;
-}
-
-/**
- * Fetch + normalize the catalog. Returns `undefined` on any failure so the
- * caller falls back to the previous layer instead of publishing an empty one.
- */
-export async function fetchLiveCatalog(
+export async function fetchCatalog(
   baseUrl: string,
   key: string,
   signal: AbortSignal,
@@ -659,1145 +130,227 @@ export async function fetchLiveCatalog(
   try {
     const res = await fetch(`${baseUrl}/models`, {
       headers: { Authorization: `Bearer ${key}` },
-      signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]),
     });
     if (!res.ok) return undefined;
-    const json = (await res.json()) as {
-      data?: Array<Record<string, unknown>>;
-      aliases?: Array<Record<string, unknown>>;
-    };
-
-    const models: GatewayModel[] = [];
-    for (const entry of json?.data ?? []) {
-      const id = typeof entry.id === "string" ? entry.id : undefined;
-      if (!id || entry.enabled === false || NOISE_PATTERN.test(id)) continue;
-      const arch = (entry.architecture ?? {}) as Record<string, unknown>;
-      const pricing = (entry.pricing ?? {}) as Record<string, unknown>;
-      // NOTE: 0 is the meaningful value here, so this must NOT go through
-      // `num()` — that helper rejects anything <= 0 and would turn a dead route
-      // into "unknown", i.e. routable. Only a non-number counts as unknown.
-      const rawRouteable = entry.routeable_endpoint_count;
-      const routeableCount =
-        typeof rawRouteable === "number" && Number.isFinite(rawRouteable) && rawRouteable >= 0
-          ? rawRouteable
-          : undefined;
+    const json = (await res.json()) as { data?: Array<Record<string, unknown>>; aliases?: Array<Record<string, unknown>> };
+    const models: CatalogModel[] = [];
+    for (const e of json.data ?? []) {
+      if (typeof e.id !== "string") continue;
+      const pricing = (e.pricing ?? {}) as Record<string, unknown>;
+      const routeableCount = typeof e.routeable_endpoint_count === "number" ? e.routeable_endpoint_count : undefined;
       models.push({
-        id,
-        name: typeof entry.name === "string" ? entry.name : undefined,
-        contextLength: num(entry.context_length),
-        pricingPrompt: num(pricing.prompt),
-        pricingCompletion: num(pricing.completion),
-        // Absent count means "unknown", which we treat as routable: only an
-        // explicit 0 is evidence of a dead route.
+        id: e.id,
+        name: typeof e.name === "string" ? e.name : undefined,
+        contextLength: typeof e.context_length === "number" ? e.context_length : undefined,
+        pricingPrompt: typeof pricing.prompt === "number" ? pricing.prompt : undefined,
+        pricingCompletion: typeof pricing.completion === "number" ? pricing.completion : undefined,
         routeable: routeableCount === undefined ? true : routeableCount > 0,
-        routeableCount,
-        endpointCount: num(entry.endpoint_count),
-        modality: typeof arch.modality === "string" ? arch.modality : undefined,
-        toolCapable: entry.tool_capable === true,
-        openWeight: entry.open_weight === true,
-        family: typeof entry.family === "string" ? entry.family : undefined,
-        creator: typeof entry.creator === "string" ? entry.creator : undefined,
-        tasks: Array.isArray(entry.tasks)
-          ? (entry.tasks as unknown[]).filter((t): t is string => typeof t === "string")
-          : undefined,
       });
     }
-
-    const aliases: GatewayAlias[] = [];
-    for (const entry of json?.aliases ?? []) {
-      const id = typeof entry.id === "string" ? entry.id : undefined;
-      if (!id) continue;
-      aliases.push({
-        id,
-        task: typeof entry.task === "string" ? entry.task : null,
-        sort: typeof entry.sort === "string" ? entry.sort : undefined,
-      });
+    const aliases: CatalogAlias[] = [];
+    for (const e of json.aliases ?? []) {
+      if (typeof e.id === "string") aliases.push({ id: e.id, task: typeof e.task === "string" ? e.task : null });
     }
-
-    // An empty catalog means the fetch told us nothing; treat it as failure so
-    // we never retire the whole provider on a truncated response.
-    if (!models.length) return undefined;
-    return { models, aliases };
+    return models.length ? { models, aliases } : undefined;
   } catch {
     return undefined;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Building models from the gateway
-// ---------------------------------------------------------------------------
-
-/**
- * Pi's `input` only models text and image. The catalog's `architecture.modality`
- * is currently the literal string `"text"` for all thirteen models with
- * `tokenizer:"unknown"`, which looks like a templated fill rather than a real
- * declaration — so it is reported as `gateway` (the endpoint's claim) and never
- * as `measured`. Audio/video in the catalog are not representable in Pi.
- */
-function inputFromModality(modality?: string): Array<"text" | "image"> {
-  const m = (modality ?? "").toLowerCase();
-  if (m.includes("image") || m.includes("vision") || m.includes("multimodal")) {
-    return ["text", "image"];
-  }
-  return ["text"];
-}
-
-/** Pi's `cost` is USD per 1M tokens — the same unit as the catalog's pricing. */
-function costFromPricing(
-  prompt: number | undefined,
-  completion: number | undefined,
-): LiveModelConfig["cost"] {
-  return {
-    input: prompt ?? 0,
-    output: completion ?? 0,
-    // The catalog publishes no cache rates. 0 is not "free" here; it is
-    // "unpriced by the endpoint", and it is labelled `gateway` so a reader can
-    // see the difference between a known-zero price and an unknown one.
-    cacheRead: 0,
-    cacheWrite: 0,
-  };
-}
-
-export function gatewayModel(listing: GatewayModel): LiveModelConfig {
-  return normalize({
-    id: listing.id,
-    name: listing.name ?? listing.id,
-    reasoning: true,
-    input: inputFromModality(listing.modality),
-    contextWindow: listing.contextLength ?? 128_000,
-    maxTokens: 16_384,
-    cost: costFromPricing(listing.pricingPrompt, listing.pricingCompletion),
-    thinkingLevelMap: VANILLA_THINKING_MAP,
-    metadata: {
-      family: listing.family,
-      creator: listing.creator,
-      tasks: listing.tasks,
-      toolCapable: listing.toolCapable,
-      openWeight: listing.openWeight,
-      endpointCount: listing.endpointCount,
-      routeableEndpointCount: listing.routeableCount,
-    },
-    provenance: {
-      contextWindow: listing.contextLength ? "gateway" : "vanilla",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: listing.modality ? "gateway" : "vanilla",
-      cost: listing.pricingPrompt || listing.pricingCompletion ? "gateway" : "vanilla",
-    },
-  });
-}
-
-/**
- * A router alias has no window and no price of its own. Bound both:
- * smallest context in the catalog (the guaranteed floor) and largest price
- * (an upper bound — understating cost is the worse error here).
- */
-export function aliasModel(
-  alias: GatewayAlias,
-  bounds: { minContext: number; maxInput: number; maxOutput: number },
-): LiveModelConfig {
-  return normalize({
-    id: alias.id,
-    name: alias.id.replace(/^cyberouter\//, "auto · "),
-    reasoning: true,
-    input: ["text"],
-    contextWindow: bounds.minContext,
-    maxTokens: 16_384,
-    cost: { input: bounds.maxInput, output: bounds.maxOutput, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: VANILLA_THINKING_MAP,
-    alias: { task: alias.task, sort: alias.sort },
-    provenance: {
-      contextWindow: "gateway",
-      maxTokens: "vanilla",
-      thinkingLevelMap: "vanilla",
-      input: "vanilla",
-      cost: "gateway",
-    },
-  });
-}
-
-export function catalogBounds(models: readonly GatewayModel[]): {
-  minContext: number;
-  maxInput: number;
-  maxOutput: number;
-} {
-  const contexts = models.map((m) => m.contextLength).filter((c): c is number => !!c);
-  const inputs = models.map((m) => m.pricingPrompt).filter((c): c is number => !!c);
-  const outputs = models.map((m) => m.pricingCompletion).filter((c): c is number => !!c);
-  return {
-    minContext: contexts.length ? Math.min(...contexts) : 128_000,
-    maxInput: inputs.length ? Math.max(...inputs) : 0,
-    maxOutput: outputs.length ? Math.max(...outputs) : 0,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Probe (only for what the gateway does not declare)
-// ---------------------------------------------------------------------------
-
-/**
- * Measure a brand-new model: effort levels, real `off` behaviour and the output
- * ceiling. Returns `undefined` on any request-level failure so the caller falls
- * back to the gateway-only build; an HTTP 400/422 per level IS a measurement.
- */
-export async function probeNewModel(
-  listing: GatewayModel,
-  baseUrl: string,
-  key: string,
-  signal: AbortSignal,
-): Promise<LiveModelConfig | undefined> {
-  const base = {
-    model: listing.id,
-    messages: PROBE_BODY_MESSAGES,
-    max_tokens: 16,
-    stream: false,
-  };
-
-  const noParam = await postChat(baseUrl, key, base, signal);
-  // Quota/auth/rate-limit/5xx is not a measurement — do not derive values from it.
-  if (!noParam.ok && !isParameterRejection(noParam)) return undefined;
-
-  const map: ThinkingLevelMap = {};
-  let anyLevelOk = false;
-  let anyReasoningSeen = (noParam.rt ?? 0) > 0;
-
-  for (const level of THINKING_LEVELS) {
-    if (signal.aborted) return undefined;
-    const r = await postChat(baseUrl, key, { ...base, reasoning_effort: level }, signal);
-    if (!r.ok && !isParameterRejection(r)) return undefined;
-    map[level] = r.ok ? level : null;
-    if (r.ok) anyLevelOk = true;
-    if ((r.rt ?? 0) > 0) anyReasoningSeen = true;
-  }
-
-  // `off`: accepted AND zero reasoning tokens → "none"
-  if (signal.aborted) return undefined;
-  const none = await postChat(baseUrl, key, { ...base, reasoning_effort: "none" }, signal);
-  if (!none.ok && !isParameterRejection(none)) return undefined;
-  map.off = none.ok && !(none.rt !== undefined && none.rt > 0) ? "none" : null;
-  if ((none.rt ?? 0) > 0) anyReasoningSeen = true;
-
-  const reasoning = anyLevelOk || none.ok || anyReasoningSeen;
-
-  // Output ceiling, walked with NO effort param so effort validation cannot
-  // confound it. The walk reports the last ACCEPTED candidate, which is a floor
-  // on the real ceiling, never an overstatement of it.
-  let highest = 0;
-  for (const n of CEILING_CANDIDATES) {
-    if (signal.aborted) return undefined;
-    const r = await postChat(baseUrl, key, { ...base, max_tokens: n }, signal, 30_000);
-    if (!r.ok) {
-      // A timeout or quota error mid-walk is not a ceiling measurement; bail out
-      // so the caller keeps the gateway-only values instead of a wrong floor.
-      if (!isParameterRejection(r)) return undefined;
-      break;
-    }
-    highest = n;
-  }
-
-  const contextWindow = listing.contextLength ?? 128_000;
-  const maxTokens = highest > 0 ? Math.min(contextWindow, highest) : 16_384;
-
-  return normalize({
-    id: listing.id,
-    name: listing.name ?? listing.id,
-    reasoning,
-    input: inputFromModality(listing.modality),
-    contextWindow,
-    maxTokens,
-    cost: costFromPricing(listing.pricingPrompt, listing.pricingCompletion),
-    thinkingLevelMap: map,
-    provenance: {
-      contextWindow: listing.contextLength ? "gateway" : "vanilla",
-      maxTokens: highest > 0 ? "measured" : "vanilla",
-      thinkingLevelMap: "measured",
-      input: listing.modality ? "gateway" : "vanilla",
-      cost: listing.pricingPrompt || listing.pricingCompletion ? "gateway" : "vanilla",
-    },
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Curated layer
-// ---------------------------------------------------------------------------
-
-const CURATED_FILE = "enclave-curated.json";
-
-/**
- * Hand-tuned values live in `<agentDir>/enclave-curated.json` as
- * `{ "models": [...] }`. Curated entries are authoritative for their values and
- * are never overwritten by the live layer — that is what makes them a place to
- * record something the gateway does not declare.
- */
-export function readCurated(agentDir: string): LiveModelConfig[] {
-  try {
-    const parsed = JSON.parse(readFileSync(join(agentDir, CURATED_FILE), "utf8")) as {
-      models?: unknown;
-    };
-    if (!Array.isArray(parsed?.models)) return [];
-    return parsed.models.filter(
-      (m): m is LiveModelConfig =>
-        !!m && typeof m === "object" && typeof (m as LiveModelConfig).id === "string",
-    );
-  } catch {
-    return []; // Missing or malformed: no curated layer, live layer still runs.
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Donor layer — inherit model-intrinsic values from another provider
-// ---------------------------------------------------------------------------
-
-/**
- * A donor is another provider's curated model list, indexed by BARE model name
- * (the id with any `vendor/` prefix removed on both sides). It exists because
- * the same open-weight model is often sold through several gateways, and the
- * facts about the MODEL — which reasoning-effort enum it accepts, whether it
- * takes images — do not change with the seller, while everything about the
- * GATEWAY does.
- *
- * What may cross over, and what may not:
- *
- *   reasoning, thinkingLevelMap, input  — intrinsic to the model. Safe to
- *     inherit, because a vendor that rejects `reasoning_effort:"minimal"`
- *     rejects it through every reseller.
- *
- *   contextWindow, maxTokens, cost      — properties of the gateway, NOT the
- *     model, and never inherited. Concretely: OpenDesign reports
- *     `maxTokens: 232000` for the DeepSeek family, but that is amr-link's
- *     context budget, not the model's ceiling. Copying it would assert that
- *     EnClave will let you emit 232k tokens — an unverified claim dressed as a
- *     measured one, which is the single failure mode this bridge is built to
- *     avoid. EnClave's own `context_length` and `pricing` always win.
- *
- * A donor is only ever a prior. It fills a field that has NO evidence yet, and
- * never overwrites one that does. The origin it writes is `inherited`, not
- * `curated`, so a reader can always tell which values were confirmed on this
- * endpoint and which were carried in from elsewhere.
- */
-
-const DONOR_FILE = "enclave-donor.json";
-
-export interface DonorConfig {
-  enabled: boolean;
-  /** Path to a Pi `models.json` holding the donor provider. */
-  modelsJson: string;
-  /** Provider key inside that file. */
-  provider: string;
-  /**
-   * The donor is the SOURCE OF TRUTH (default). Its model-intrinsic values
-   * override the probe and the local curated layer for the same base model.
-   *
-   * This is a deliberate inversion of the usual precedence, and it has a real
-   * cost: where the two disagree, you publish the donor's claim instead of a
-   * value confirmed on this endpoint. Measured 2026-10-03, EnClave accepted all
-   * six effort levels for `glm-5.3-flash` where the donor claims only
-   * low/high/max — so in authority mode Pi stops offering `minimal` and
-   * `medium` for a model that would have taken them.
-   *
-   * Set false to restore "evidence first": the donor then only fills fields that
-   * have no evidence yet, and any successful probe wins.
-   */
-  authority: boolean;
-}
-
-export interface DonorIndex {
-  config: DonorConfig;
-  /** bare model name -> donor entry */
-  byBareName: Map<string, LiveModelConfig>;
-  /** bare names the donor has that no live model matched (report-only) */
-  source: Set<string>;
-}
-
-/**
- * Which origins a donor is allowed to overwrite, per field.
- *
- * `vanilla` only means "fill the gap". `input` additionally allows `gateway`
- * because EnClave's `architecture.modality` is a documented templated fill —
- * the literal string "text" for all fourteen models with `tokenizer:"unknown"`
- * — so a measured value from elsewhere is strictly better evidence than that
- * declaration. `measured` and `curated` are never overwritten.
- */
-const DONOR_FILL: Record<string, ValueOrigin[]> = {
-  reasoning: ["vanilla"],
-  thinkingLevelMap: ["vanilla"],
-  input: ["vanilla", "gateway"],
-};
-
-/**
- * Numeric fields the donor now also owns in authority mode: `contextWindow` and
- * `maxTokens`.
- *
- * They are accepted with a clamp — the donor may LOWER a value that already has
- * evidence, never raise it above it. That direction matters. Adopted unchecked,
- * a donor claiming a wider window than the endpoint serves would be a false
- * claim published as truth; adopted clamped, the worst case is that Pi
- * under-promises a model that could have done more, which costs capability and
- * never correctness.
- *
- * Verified against the live endpoint on 2026-10-03: every donor value for these
- * fields is LOWER than what EnClave actually allows, for all four matching
- * models — so the clamp never binds today, and the donor's numbers stand.
- *
- * `cost` is still excluded: the donor has no price at all, so inheriting it
- * would publish every model as free.
- */
-const DONOR_NUMERIC_FIELDS = ["contextWindow", "maxTokens"] as const;
-
-function bareName(id: string): string {
-  const i = id.lastIndexOf("/");
-  return i === -1 ? id : id.slice(i + 1);
-}
-
-/** Read the donor config; defaults to the sibling OpenDesign provider. */
-export function readDonorConfig(agentDir: string): DonorConfig {
-  const fallback: DonorConfig = {
-    enabled: true,
-    modelsJson: join(agentDir, "models.json"),
-    provider: "opendesign",
-    authority: true,
-  };
-  try {
-    const parsed = JSON.parse(readFileSync(join(agentDir, DONOR_FILE), "utf8")) as Partial<DonorConfig>;
-    return {
-      enabled: parsed.enabled !== false,
-      modelsJson: parsed.modelsJson ?? fallback.modelsJson,
-      provider: parsed.provider ?? fallback.provider,
-      authority: parsed.authority !== false,
-    };
-  } catch {
-    return fallback;
-  }
-}
-
-/** Build the bare-name index. An unreadable donor yields an empty index. */
-export function buildDonorIndex(config: DonorConfig): DonorIndex {
-  const byBareName = new Map<string, LiveModelConfig>();
-  const source = new Set<string>();
-  if (!config.enabled) return { config, byBareName, source };
-  try {
-    const parsed = JSON.parse(readFileSync(config.modelsJson, "utf8")) as {
-      providers?: Record<string, { models?: LiveModelConfig[] }>;
-    };
-    for (const m of parsed.providers?.[config.provider]?.models ?? []) {
-      if (!m || typeof m.id !== "string") continue;
-      const bare = bareName(m.id);
-      source.add(bare);
-      // First definition wins, so a duplicate cannot silently override.
-      if (!byBareName.has(bare)) byBareName.set(bare, m);
-    }
-  } catch {
-    // No donor file, or unreadable: the bridge simply runs without it.
-  }
-  return { config, byBareName, source };
-}
-
-export interface DonorResult {
-  model: LiveModelConfig;
-  /** fields actually taken from the donor, for reporting */
-  inherited: string[];
-}
-
-/**
- * Fill evidence-free fields from the donor. Never overwrites `measured` or
- * `curated`, and never touches a gateway-specific field.
- */
-export function applyDonor(model: LiveModelConfig, donor: DonorIndex | undefined): DonorResult {
-  if (!donor || !donor.byBareName.size) return { model, inherited: [] };
-  const entry = donor.byBareName.get(bareName(model.id));
-  if (!entry) return { model, inherited: [] };
-
-  // In authority mode the donor's fields win outright — except the numeric ones,
-  // which are clamped to the evidence we already hold (see DONOR_NUMERIC_FIELDS).
-  // The label still records where the value came from, so a reader is never told
-  // a carried-in value was measured here.
-  const authority = donor.config.authority;
-
-  const next: LiveModelConfig = { ...model, provenance: { ...(model.provenance ?? ({} as ValueProvenance)) } };
-  const inherited: string[] = [];
-
-  // `reasoning` is a plain boolean with no provenance slot, so it is only taken
-  // when the donor actually states it.
-  if (
-    typeof entry.reasoning === "boolean" &&
-    entry.reasoning !== model.reasoning &&
-    (authority || DONOR_FILL.reasoning.includes(model.provenance?.thinkingLevelMap ?? "vanilla"))
-  ) {
-    next.reasoning = entry.reasoning;
-    inherited.push("reasoning");
-  }
-
-  for (const field of DONOR_NUMERIC_FIELDS) {
-    const origin = (model.provenance?.[field] ?? "vanilla") as ValueOrigin;
-    if (!authority && origin !== "vanilla") continue;
-    const donorNumber = entry[field];
-    const currentNumber = model[field];
-    if (typeof donorNumber !== "number" || typeof currentNumber !== "number") continue;
-    // No evidence yet → the donor fills the gap outright, so a wider window is
-    // adopted. Evidence in hand → the donor may only LOWER it, never raise it
-    // above something already confirmed.
-    const value = origin === "vanilla" ? donorNumber : Math.min(donorNumber, currentNumber);
-    if (value === currentNumber) continue;
-    (next as Record<string, unknown>)[field] = value;
-    (next.provenance as Record<string, unknown>)[field] = "inherited";
-    inherited.push(field);
-  }
-
-  for (const field of ["thinkingLevelMap", "input"] as const) {
-    const current = (model.provenance?.[field] ?? "vanilla") as ValueOrigin;
-    if (!authority && !DONOR_FILL[field].includes(current)) continue;
-    const donorValue = entry[field];
-    // A donor with nothing to say is never allowed to blank a known value.
-    if (donorValue === undefined || donorValue === null) continue;
-    if (JSON.stringify(model[field]) === JSON.stringify(donorValue)) continue;
-    (next as Record<string, unknown>)[field] = donorValue;
-    (next.provenance as Record<string, unknown>)[field] = "inherited";
-    inherited.push(field);
-  }
-
-  return { model: next, inherited };
-}
-
-// ---------------------------------------------------------------------------
-// Retirement ledger
-// ---------------------------------------------------------------------------
-
-const RETIRED_FILE = "enclave-retired.json";
-
-export type RetirementReason = "not-listed" | "not-routable" | "upstream-gone";
-
-export interface RetiredLedger {
-  updatedAt: number;
-  /** id -> { at, reason } */
-  retired: Record<string, { at: number; reason: RetirementReason }>;
-  /**
-   * Pending `upstream-gone` evidence, id -> sightings.
-   *
-   * This one is deliberately NOT acted on immediately. Unlike `not-listed` and
-   * `not-routable`, which are the gateway describing itself, `upstream-gone` is
-   * us reading an error body against the catalog's own "healthy" claim. A
-   * deployment can be pulled for maintenance and returned, and a proxy can
-   * mislabel a temporary condition as 410. So it takes a repeated sighting,
-   * separated in time, before it becomes a retirement — and the ledger is
-   * self-correcting, so the cost of being wrong is bounded to the window.
-   */
-  upstreamGone?: Record<string, { first: number; last: number; sightings: number }>;
-}
-
-function readRetiredLedger(agentDir: string): RetiredLedger {
-  try {
-    const parsed = JSON.parse(readFileSync(join(agentDir, RETIRED_FILE), "utf8")) as RetiredLedger;
-    if (parsed && typeof parsed === "object" && parsed.retired && typeof parsed.retired === "object") {
-      return parsed;
-    }
-  } catch {
-    // Missing or corrupt → "nothing retired", so we never hide a model.
-  }
-  return { updatedAt: 0, retired: {}, upstreamGone: {} };
-}
-
-function persistRetiredLedger(agentDir: string, retired: RetiredLedger["retired"], upstreamGone: RetiredLedger["upstreamGone"]): RetiredLedger {
-  const updated: RetiredLedger = { updatedAt: Date.now(), retired, upstreamGone };
-  writeRetiredLedger(agentDir, updated);
-  return updated;
-}
-
-function writeRetiredLedger(agentDir: string, ledger: RetiredLedger): void {
-  try {
-    writeFileSync(join(agentDir, RETIRED_FILE), `${JSON.stringify(ledger, null, 2)}\n`);
-  } catch {
-    // A read-only agent dir must not break the refresh.
-  }
-}
-
-/**
- * Record which known ids a SUCCESSFUL live check stopped serving, under either
- * signal. Self-correcting: an id the endpoint serves again is un-retired.
- */
-function reconcileRetired(
-  agentDir: string,
-  catalog: LiveCatalog,
-  candidates: readonly LiveModelConfig[],
-): RetiredLedger {
-  const ledger = readRetiredLedger(agentDir);
-  const now = Date.now();
-  const next: RetiredLedger["retired"] = { ...ledger.retired };
-
-  const listed = new Map(catalog.models.map((m) => [m.id, m]));
-  // Only ROUTABLE ids count as live. A listed id with no healthy route is a
-  // retirement signal in its own right; counting it as live here would make the
-  // `not-routable` branch below unreachable and leave an unroutable model in
-  // the store forever, where phase 1 would keep restoring it.
-  const liveIds = new Set([
-    ...catalog.models.filter((m) => m.routeable !== false).map((m) => m.id),
-    ...catalog.aliases.map((a) => a.id),
-  ]);
-
-  // Clear a retirement ONLY when the reason is one the gateway asserts about
-  // itself. `upstream-gone` is our reading of an error body against the
-  // catalog's own "healthy" claim, so it is not this function's to clear —
-  // otherwise the next refresh would resurrect a model this same sweep retired,
-  // since the catalog still lists it as routable. Only the sweep revives those.
-  for (const id of Object.keys(next)) {
-    const reason = next[id]?.reason;
-    const gatewayAsserted = reason === "not-listed" || reason === "not-routable";
-    if (gatewayAsserted && liveIds.has(id)) delete next[id];
-  }
-
-  for (const m of candidates) {
-    if (liveIds.has(m.id)) continue;
-    const entry = listed.get(m.id);
-    // Present in the catalog but with no healthy route for this key.
-    const reason: RetirementReason = entry ? "not-routable" : "not-listed";
-    if (!next[m.id]) next[m.id] = { at: now, reason }; // keep the original date
-  }
-
-  if (JSON.stringify(next) === JSON.stringify(ledger.retired)) return ledger;
-  return persistRetiredLedger(agentDir, next, ledger.upstreamGone);
-}
-
-export function retiredIds(agentDir: string): Set<string> {
-  return new Set(Object.keys(readRetiredLedger(agentDir).retired));
-}
-
-// ---------------------------------------------------------------------------
-// Upstream-gone sweep — the one retirement signal we have to argue for
-// ---------------------------------------------------------------------------
-
-/** A model must be seen gone this many times before it is retired. */
-const UPSTREAM_GONE_SIGHTINGS = 2;
-/** ...and not sooner than this, so a blip cannot accumulate two strikes. */
-const UPSTREAM_GONE_CONFIRM_MS = 2 * 60_000;
-
-/**
- * One cheap call to see whether a model answers at all. Returns the failure
- * class, or `"ok"`. Cheaper than a full probe by an order of magnitude, which
- * matters because the sweep visits every model.
- */
-export async function checkLiveness(
+/** Cheap liveness call. Returns an error class, or "ok". */
+export async function liveness(
   baseUrl: string,
   key: string,
   modelId: string,
   signal: AbortSignal,
-): Promise<FailureKind | "ok"> {
-  const r = await postChat(
-    baseUrl,
-    key,
-    { model: modelId, messages: [{ role: "user", content: "hi" }], max_tokens: 8 },
-    signal,
-    20_000,
-  );
-  return r.ok ? "ok" : classifyFailure(r.status, r.body);
-}
-
-export interface UpstreamGoneReport {
-  checkedAt: string;
-  gone: Array<{ id: string; sightings: number; retired: boolean }>;
-  revived: string[];
-  healthy: number;
-}
-
-/**
- * Record an `upstream-gone` sighting per model and retire once the evidence
- * repeats after a minimum delay.
- *
- * Never called from the refresh path. The catalog is the gateway's own
- * statement about itself, and overriding it on the strength of an error body is
- * a different class of decision than dropping an id it stopped listing — so this
- * runs only from the deliberate audit.
- */
-export async function sweepUpstreamGone(options: {
-  agentDir: string;
-  baseUrl: string;
-  key: string;
-  signal: AbortSignal;
-  catalog: LiveCatalog;
-}): Promise<UpstreamGoneReport> {
-  const { agentDir, baseUrl, key, signal, catalog } = options;
-  const ledger = readRetiredLedger(agentDir);
-  const now = Date.now();
-  const sightings = { ...(ledger.upstreamGone ?? {}) };
-  const retired = { ...ledger.retired };
-
-  const gone: UpstreamGoneReport["gone"] = [];
-  const revived: string[] = [];
-  let healthy = 0;
-
-  for (const listing of catalog.models) {
-    if (signal.aborted) break;
-    const kind = await checkLiveness(baseUrl, key, listing.id, signal);
-    if (signal.aborted) break;
-
-    if (kind === "ok" || kind === "no-route" || kind === "parameter") {
-      // Recovered, or a structural signal we already handle elsewhere.
-      if (sightings[listing.id]) {
-        delete sightings[listing.id];
-        if (!revived.includes(listing.id)) revived.push(listing.id);
-      }
-      if (kind === "ok") {
-        healthy++;
-        // Self-correcting: a model that answers again is un-retired. Scoped to
-        // `upstream-gone` on purpose — `not-listed` and `not-routable` are the
-        // gateway's own structural claims and are cleared by reconcileRetired,
-        // not by us overriding them from an error body.
-        if (retired[listing.id]?.reason === "upstream-gone") {
-          delete retired[listing.id];
-          if (!revived.includes(listing.id)) revived.push(listing.id);
-        }
-      }
-      continue;
-    }
-
-    if (kind !== "upstream-gone") continue;
-
-    const prior = sightings[listing.id];
-    const record = prior
-      ? { first: prior.first, last: now, sightings: prior.sightings + 1 }
-      : { first: now, last: now, sightings: 1 };
-    sightings[listing.id] = record;
-
-    const confirmed = record.sightings >= UPSTREAM_GONE_SIGHTINGS && now - record.first >= UPSTREAM_GONE_CONFIRM_MS;
-    if (confirmed && !retired[listing.id]) {
-      retired[listing.id] = { at: now, reason: "upstream-gone" };
-    }
-    gone.push({ id: listing.id, sightings: record.sightings, retired: Boolean(retired[listing.id]) });
-  }
-
-  const before = JSON.stringify([ledger.retired, ledger.upstreamGone ?? {}]);
-  const after = JSON.stringify([retired, sightings]);
-  if (before !== after) persistRetiredLedger(agentDir, retired, sightings);
-
-  return { checkedAt: new Date(now).toISOString(), gone, revived, healthy };
-}
-
-// ---------------------------------------------------------------------------
-// Curated re-probe audit — PI_ENCLAVE_REPROBE
-// ---------------------------------------------------------------------------
-
-export interface ReprobeFinding {
-  id: string;
-  field: "contextWindow" | "maxTokens" | "thinkingLevelMap" | "reasoning" | "input" | "cost";
-  curated: unknown;
-  measured: unknown;
-  status: "changed" | "match" | "probe-failed";
-  /** What the "measured" side actually IS. See FIELD_BASIS. */
-  basis: "probe" | "gateway-declaration" | "none";
-}
-
-export interface ReprobeReport {
-  generatedAt: string;
-  baseUrl: string;
-  audited: number;
-  changed: ReprobeFinding[];
-  retired: Array<{ id: string; reason: RetirementReason }>;
-  uncurated: string[];
-  findings: ReprobeFinding[];
-}
-
-function truthyEnv(envName: string): boolean {
-  const v = (process.env[envName] ?? "").trim().toLowerCase();
-  return v === "1" || v === "true" || v === "on" || v === "yes";
-}
-
-/**
- * Numeric comparison with tolerance: curated values are written in round units
- * (128_000) while the gateway declares exact powers of two (131_072). Same
- * window, different notation — flagging it would bury real drift in noise.
- */
-function numericClose(a: number, b: number): boolean {
-  return Math.abs(a - b) <= 0.05 * Math.max(Math.abs(a), Math.abs(b));
-}
-
-/**
- * Which side is authoritative per field. Only `maxTokens`,
- * `thinkingLevelMap` and `reasoning` are actually probed; `contextWindow`,
- * `input` and `cost` are the endpoint's own declaration. Reading a context
- * drift as "my curated value is wrong" would overwrite a verified number with
- * an unverified one.
- */
-const FIELD_BASIS: Record<ReprobeFinding["field"], ReprobeFinding["basis"]> = {
-  contextWindow: "gateway-declaration",
-  maxTokens: "probe",
-  thinkingLevelMap: "probe",
-  reasoning: "probe",
-  input: "gateway-declaration",
-  cost: "gateway-declaration",
-};
-
-function diffCuratedVsGateway(
-  curated: LiveModelConfig,
-  observed: LiveModelConfig,
-): ReprobeFinding[] {
-  const out: ReprobeFinding[] = [];
-  const numeric = (field: "contextWindow" | "maxTokens") => {
-    const a = Number(curated[field] ?? 0);
-    const b = Number(observed[field] ?? 0);
-    return numericClose(a, b) ? null : { field, curated: a, measured: b };
-  };
-  const exact = (field: "thinkingLevelMap" | "reasoning" | "input") => {
-    const a = JSON.stringify(curated[field] ?? null);
-    const b = JSON.stringify(observed[field] ?? null);
-    return a === b ? null : { field, curated: curated[field] ?? null, measured: observed[field] ?? null };
-  };
-  for (const field of ["contextWindow", "maxTokens"] as const) {
-    const d = numeric(field);
-    if (d) out.push({ id: curated.id, status: "changed", basis: FIELD_BASIS[field], ...d });
-  }
-  for (const field of ["thinkingLevelMap", "reasoning", "input"] as const) {
-    const d = exact(field);
-    if (d) out.push({ id: curated.id, status: "changed", basis: FIELD_BASIS[field], ...d });
-  }
-  return out;
-}
-
-function fmt(v: unknown): string {
-  return typeof v === "string" ? v : JSON.stringify(v);
-}
-
-function writeReprobeReport(agentDir: string, report: ReprobeReport): void {
+): Promise<"ok" | "no-route" | "upstream-gone" | "other"> {
   try {
-    writeFileSync(join(agentDir, "enclave-reprobe.json"), `${JSON.stringify(report, null, 2)}\n`);
+    const res = await fetch(`${baseUrl}/chat/completions`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model: modelId, messages: [{ role: "user", content: "hi" }], max_tokens: 8 }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(20_000)]),
+    });
+    if (res.ok) return "ok";
+    const body = await res.text().catch(() => "");
+    if (res.status === 404) return "no-route";
+    // The router is a tunnel: it reports the upstream status in the body.
+    const m = /returned HTTP (\d{3})/i.exec(body);
+    if (m?.[1] === "410") return "upstream-gone";
+    return "other";
   } catch {
-    /* read-only agent dir */
+    return "other";
   }
 }
 
+// ---------------------------------------------------------------------------
+// Building the block
+// ---------------------------------------------------------------------------
+
+export interface BuildResult {
+  models: ModelEntry[];
+  fromDonor: string[];
+  fromExisting: string[];
+  pending: string[];
+  skipped: Array<{ id: string; why: string }>;
+}
+
+const num = (v: unknown, fallback: number) => (typeof v === "number" && v > 0 ? v : fallback);
+
 /**
- * Re-check curated values against the endpoint and report drift. Report-only by
- * design: promoting an observed value automatically is exactly what this audit
- * exists to make unnecessary.
+ * Build the EnClave model block from the live catalog, the donor and whatever
+ * the EnClave block already says.
+ *
+ * @param alive pass a predicate that filters the live ids first, so callers can
+ *   drop models that do not actually answer.
  */
-export async function runReprobeAudit(options: {
-  agentDir: string;
-  baseUrl: string;
-  key: string;
-  signal: AbortSignal;
-  curated: readonly LiveModelConfig[];
-  catalog: LiveCatalog;
-}): Promise<ReprobeReport> {
-  const { agentDir, baseUrl, key, signal, curated, catalog } = options;
-  // The audit is the deliberate act, so this is where the upstream-gone signal
-  // is allowed to act on the catalog's own "healthy" claim.
-  const sweep = await sweepUpstreamGone({ agentDir, baseUrl, key, signal, catalog });
-  if (signal.aborted) {
-    const empty: ReprobeReport = {
-      generatedAt: new Date().toISOString(),
-      baseUrl,
-      audited: catalog.models.length,
-      changed: [],
-      retired: [],
-      uncurated: [],
-      findings: [],
-    };
-    return empty;
-  }
-  const ledger = readRetiredLedger(agentDir);
-  const findings: ReprobeFinding[] = [];
-  const retired = Object.entries(ledger.retired).map(([id, v]) => ({ id, reason: v.reason }));
-  const curatedIds = new Set(curated.map((m) => m.id));
+export function buildBlock(
+  catalog: LiveCatalog,
+  donor: Map<string, ModelEntry>,
+  existing: readonly ModelEntry[],
+  baseUrl: string,
+  alive: (id: string) => boolean = () => true,
+): BuildResult {
+  const existingByBare = new Map(existing.map((m) => [bareName(m.id), m]));
+  const models: ModelEntry[] = [];
+  const fromDonor: string[] = [];
+  const fromExisting: string[] = [];
+  const pending: string[] = [];
+  const skipped: Array<{ id: string; why: string }> = [];
 
   for (const listing of catalog.models) {
-    if (signal.aborted) break;
-    const known = curated.find((m) => m.id === listing.id);
-    const uncurated = !known;
-    if (!known) {
-      findings.push({
-        id: listing.id,
-        field: "maxTokens",
-        curated: null,
-        measured: null,
-        status: "probe-failed",
-        basis: "none",
-      });
-    }
-
-    const probed = await probeNewModel(listing, baseUrl, key, signal);
-    if (signal.aborted) break;
-    if (!probed) {
-      if (known) {
-        findings.push({
-          id: listing.id,
-          field: "maxTokens",
-          curated: known.maxTokens,
-          measured: null,
-          status: "probe-failed",
-          basis: "none",
-        });
-      }
+    // routeable_endpoint_count 0 means the catalog lists it but this key has no
+    // healthy route: every request 404s. Offering it would be the ghost-model
+    // bug, so the catalog's own health field is enough to exclude it.
+    if (!listing.routeable) {
+      skipped.push({ id: listing.id, why: "sin ruta para esta clave" });
       continue;
     }
-    if (known) findings.push(...diffCuratedVsGateway(known, probed));
-  }
+    if (!alive(listing.id)) {
+      skipped.push({ id: listing.id, why: "no responde" });
+      continue;
+    }
+    const bare = bareName(listing.id);
+    const entry: ModelEntry = {
+      id: listing.id,
+      name: listing.name ?? listing.id,
+      reasoning: true,
+      thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
+      input: ["text"],
+      contextWindow: num(listing.contextLength, 128_000),
+      maxTokens: 16_384,
+      // The donor carries no per-model compat (it keeps its own at provider
+      // level), and this block REPLACES rather than merges, so without a
+      // default here the flag is silently dropped. Pi then sends
+      // role:"developer", which this gateway rejects with
+      //   messages.0.role: Invalid option: expected one of
+      //   "system"|"user"|"assistant"|"tool"
+      // Set before the donor copy, so a donor that does declare compat wins.
+      compat: { supportsDeveloperRole: false },
+    };
 
-  const report: ReprobeReport = {
-    generatedAt: new Date().toISOString(),
-    baseUrl,
-    audited: catalog.models.length,
-    changed: findings.filter((f) => f.status === "changed"),
-    retired,
-    uncurated: catalog.models.filter((m) => !curatedIds.has(m.id)).map((m) => m.id),
-    findings,
-  };
-
-  writeReprobeReport(agentDir, report);
-
-  const lines = [
-    `enclave re-probe ${report.generatedAt} — ${report.audited} models, ${report.changed.length} changed`,
-  ];
-  for (const f of report.changed) {
-    lines.push(`  ${f.id} ${f.field}: ${fmt(f.curated)} -> ${fmt(f.measured)} [${f.basis}]`);
-  }
-  if (retired.length) {
-    for (const r of retired) lines.push(`  RETIRED ${r.id} (${r.reason})`);
-  }
-  const failed = findings.filter((f) => f.status === "probe-failed").length;
-  if (failed) lines.push(`  ${failed} probe-failed (endpoint did not answer with a measurement)`);
-  console.error(`[enclave-bridge] ${lines.join("\n")}`);
-  return report;
-}
-
-// ---------------------------------------------------------------------------
-// refreshModels
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// The single build funnel
-// ---------------------------------------------------------------------------
-
-/**
- * Every published model goes through here, on every path — live refresh, offline
- * restore, and the statically registered snapshot alike.
- *
- * This exists because the layers were being applied per-path by hand, and each
- * omission was a silent correctness bug: the offline baked snapshot skipped the
- * retirement ledger, then skipped the donor, while the live path did both. Three
- * of these had already shipped. Funnelling means a new layer is applied once,
- * here, and cannot be forgotten on one branch.
- */
-export interface FinalizeContext {
-  donor?: DonorIndex;
-  retired?: ReadonlySet<string>;
-}
-
-export function finalize(m: LiveModelConfig, ctx: FinalizeContext = {}): LiveModelConfig {
-  const base = normalize(m);
-  return ctx.donor ? applyDonor(base, ctx.donor).model : base;
-}
-
-/**
- * The list-level counterpart: normalize + donor on each entry, then drop the
- * retired ones. Retirement is a list operation — a single model cannot remove
- * itself — so it lives here and nowhere else.
- */
-export function finalizeAll(models: readonly LiveModelConfig[], ctx: FinalizeContext = {}): LiveModelConfig[] {
-  const retired = ctx.retired ?? new Set<string>();
-  const out: LiveModelConfig[] = [];
-  for (const m of models) {
-    if (retired.has(m.id)) continue;
-    out.push(finalize(m, ctx));
-  }
-  return out;
-}
-
-/**
- * The static catalog for registration, built through the same funnel so the
- * eagerly registered list is byte-identical to what a refresh would publish.
- * Without this, `pi --list-models` — which never touches the network — showed
- * the raw snapshot: vanilla max-out and no images, while the live path showed
- * inherited values for the same models.
- */
-export function buildStaticCatalog(agentDir: string): LiveModelConfig[] {
-  return finalizeAll([...SNAPSHOT_MODELS, ...SNAPSHOT_ALIAS_MODELS], {
-    donor: buildDonorIndex(readDonorConfig(agentDir)),
-    retired: retiredIds(agentDir),
-  });
-}
-
-export interface RefreshModelsOptions {
-  agentDir: string;
-  fallbackBaseUrl?: string;
-  /** Test hook: force the endpoint (production leaves this undefined). */
-  baseUrlOverride?: string;
-  /** Env var name for the kill switch (default PI_ENCLAVE_LIVE). */
-  killSwitchEnv?: string;
-  /** Env var name for the re-probe audit (default PI_ENCLAVE_REPROBE). */
-  reprobeEnv?: string;
-  /** Env var name that opts INTO probing during refresh (default PI_ENCLAVE_PROBE). */
-  probeEnv?: string;
-  /**
-   * Probe brand-new ids during refresh. Off by DEFAULT.
-   *
-   * A probe is ~16 sequential requests per model. On a fourteen-model catalog
-   * that is minutes, and `refreshModels` is awaited during interactive startup
-   * — so probing there trades a correct catalog for a TUI that appears to
-   * hang. The gateway already declares context and price correctly, and the
-   * donor fills reasoning levels, so the default refresh publishes accurate
-   * values immediately; measurement is a deliberate step via the CLI
-   * (`--all`) or PI_ENCLAVE_REPROBE.
-   */
-  probe?: boolean;
-}
-
-function liveDisabled(envName: string): boolean {
-  const v = process.env[envName];
-  return v === "0" || v === "false" || v === "off";
-}
-
-function sameModels(a: readonly LiveModelConfig[], b: readonly LiveModelConfig[]): boolean {
-  return JSON.stringify(a) === JSON.stringify(b);
-}
-
-/**
- * Pi's extension loader treats EVERY `extensions/*.ts` file as an extension
- * factory, so this helper module must expose a no-op default factory to load
- * silently next to `index.ts`.
- */
-export default async function enclaveLiveHelper(): Promise<void> {}
-
-export function makeRefreshModels(options: RefreshModelsOptions) {
-  const envName = options.killSwitchEnv ?? "PI_ENCLAVE_LIVE";
-  const fallbackBaseUrl = options.fallbackBaseUrl ?? ENCLAVE_BASE_URL;
-  const probeEnv = options.probeEnv ?? "PI_ENCLAVE_PROBE";
-
-  return async function refreshModels(
-    ctx: RefreshModelsContextLike,
-  ): Promise<LiveModelConfig[] | undefined> {
-    if (liveDisabled(envName)) return undefined;
-
-    const curated = readCurated(options.agentDir).map((m) => normalize(m));
-    const curatedById = new Map(curated.map((m) => [m.id, m]));
-    // Read once per refresh. A missing or unreadable donor is not an error:
-    // `buildDonorIndex` yields an empty index and every fill is skipped.
-    const donor = buildDonorIndex(readDonorConfig(options.agentDir));
-    const authority = donor.config.authority;
-    const retired = retiredIds(options.agentDir);
-    const baseUrl = options.baseUrlOverride ?? fallbackBaseUrl;
-    const storedModels = (ctx.stored?.models ?? []).filter(
-      (m) => m && typeof m.id === "string" && (!m.provider || m.provider === PROVIDER_ID),
-    );
-
-    // ---- Phase 1: cache-only restore (runs on every runtime creation) ----
-    if (!ctx.allowNetwork) {
-      if (!storedModels.length) {
-        // The baked snapshot must clear the retirement ledger exactly like every
-        // other layer. Registering it filtered is not enough: this offline
-        // fallback is returned to Pi directly and is what the no-network path
-        // publishes, so an unfiltered copy here resurrects whatever was retired
-        // after the snapshot was taken.
-        const baked = finalizeAll([...SNAPSHOT_MODELS, ...SNAPSHOT_ALIAS_MODELS], {
-          donor,
-          retired: retiredIds(options.agentDir),
-        });
-        return baked.length ? baked : undefined;
+    const from = donor.get(bare);
+    if (from) {
+      for (const f of DONOR_FIELDS) if (from[f] !== undefined) entry[f] = from[f] as never;
+      fromDonor.push(listing.id);
+    } else {
+      const was = existingByBare.get(bare);
+      if (was) {
+        for (const f of DONOR_FIELDS) if (was[f] !== undefined) entry[f] = was[f] as never;
+        fromExisting.push(listing.id);
+      } else {
+        pending.push(listing.id);
       }
-      // Ids a previous SUCCESSFUL live check found retired must not come back,
-      // neither from the store nor from the curated file.
-      const alive = (m: LiveModelConfig) => !retired.has(m.id);
-      const liveStored = storedModels.filter(alive);
-      const liveCurated = curated.filter(alive);
-      const ids: string[] = [];
-      for (const m of [...liveStored, ...liveCurated]) if (!ids.includes(m.id)) ids.push(m.id);
-      const merged = ids.map((id) =>
-        finalize(curatedById.get(id) ?? (liveStored.find((m) => m.id === id) as LiveModelConfig), {
-          donor,
-          retired,
-        }),
-      );
-      if (ctx.signal.aborted) return undefined;
-      if (!sameModels(merged, storedModels)) {
-        const ok = await ctx.publish({
-          persist: { models: merged, checkedAt: ctx.stored?.checkedAt },
-        });
-        if (!ok || ctx.signal.aborted) return undefined;
-      }
-      return merged;
     }
 
-    // ---- Phase 2: live membership (network + credential) ----
-    const key = ctx.credential?.type === "api_key" ? ctx.credential.key : undefined;
-    if (!key) return undefined;
+    // The gateway owns these two: they are facts about this endpoint.
+    if (listing.contextLength) entry.contextWindow = listing.contextLength;
+    entry.cost = {
+      input: listing.pricingPrompt ?? 0,
+      output: listing.pricingCompletion ?? 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+    };
+    entry.api = "openai-completions";
+    models.push(entry);
+  }
 
-    const catalog = await fetchLiveCatalog(baseUrl, key, ctx.signal);
+  // Router aliases: usable as a model, but their window and price depend on
+  // which concrete model the router picks per request, so both are bounded
+  // rather than guessed — context at the catalog floor, price at the ceiling.
+  const contexts = catalog.models.map((m) => m.contextLength).filter((c): c is number => !!c);
+  const pricesIn = catalog.models.map((m) => m.pricingPrompt).filter((c): c is number => !!c);
+  const pricesOut = catalog.models.map((m) => m.pricingCompletion).filter((c): c is number => !!c);
+  for (const alias of catalog.aliases) {
+    if (!alive(alias.id)) {
+      skipped.push({ id: alias.id, why: "no responde" });
+      continue;
+    }
+    const bare = bareName(alias.id);
+    const from = donor.get(bare) ?? existingByBare.get(bare);
+    models.push({
+      compat: { supportsDeveloperRole: false },
+      ...(from ? Object.fromEntries(DONOR_FIELDS.filter((f) => from[f] !== undefined).map((f) => [f, from[f]])) : {}),
+      id: alias.id,
+      name: alias.id,
+      api: "openai-completions",
+      reasoning: true,
+      thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
+      input: ["text"],
+      contextWindow: contexts.length ? Math.min(...contexts) : 128_000,
+      maxTokens: 16_384,
+      cost: {
+        input: pricesIn.length ? Math.max(...pricesIn) : 0,
+        output: pricesOut.length ? Math.max(...pricesOut) : 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+      },
+    });
+  }
+
+  return { models, fromDonor, fromExisting, pending, skipped };
+}
+
+// ---------------------------------------------------------------------------
+// refreshModels — membership only
+// ---------------------------------------------------------------------------
+
+export interface RefreshModelsContextLike {
+  credential?: { type?: string; key?: string };
+  stored?: { models?: readonly ModelEntry[] };
+  publish(p: { persist?: { models: ModelEntry[]; checkedAt?: number } | null; update?: () => void }): Promise<boolean>;
+  allowNetwork: boolean;
+  signal: AbortSignal;
+}
+
+/** This module is imported by index.ts, so it needs a valid factory export. */
+export default async function enclaveHelper(): Promise<void> {}
+
+/**
+ * Keep membership fresh. Values come from `models.json`, which the sync script
+ * owns — this only adds ids the endpoint started serving and drops ids it
+ * stopped. It never invents a value.
+ */
+export function makeRefreshModels(agentDir: string, baseUrl = ENCLAVE_BASE_URL) {
+  return async function refreshModels(ctx: RefreshModelsContextLike): Promise<ModelEntry[] | undefined> {
+    if (process.env.PI_ENCLAVE_LIVE === "0") return undefined;
+    const key = ctx.credential?.type === "api_key" ? ctx.credential.key : undefined;
+    if (!ctx.allowNetwork || !key) return undefined;
+
+    const catalog = await fetchCatalog(baseUrl, key, ctx.signal);
     if (!catalog || ctx.signal.aborted) return undefined;
 
-    // This fetch SUCCEEDED, so it is authoritative about membership AND about
-    // which listed ids actually have a healthy route for this key.
-    reconcileRetired(options.agentDir, catalog, [...storedModels, ...curated]);
+    const live = new Set<string>([...catalog.models.filter((m) => m.routeable).map((m) => m.id), ...catalog.aliases.map((a) => a.id)]);
+    const configured = providerModels(readModelsJson(agentDir), PROVIDER_ID);
 
-    const storedById = new Map(storedModels.map((m) => [m.id, m]));
-    const bounds = catalogBounds(catalog.models);
-    const out: LiveModelConfig[] = [];
+    // Known values for anything the endpoint still serves. A new id has no
+    // values here; `scripts/sync-models.mjs` is what fills it in.
+    const out = configured.filter((m) => live.has(m.id));
+    for (const id of live) if (!out.some((m) => m.id === id)) out.push({ id, name: id });
 
-    // Circuit breaker for probing. A brand-new id costs ~8 sequential chat
-    // requests, and when the chat endpoint is down EVERY probe fails for a
-    // reason that says nothing about the model. Without this, a fourteen-model
-    // catalog would spend a minute failing before publishing anything. After
-    // PROBE_FAILURE_LIMIT consecutive non-measurements we stop probing for the
-    // rest of this refresh and let the gateway values stand — the honest
-    // degradation, reached in seconds instead of a minute.
-    let probeTripped = false;
-    let probeFailures = 0;
-
-    for (const listing of catalog.models) {
-      if (ctx.signal.aborted) return undefined;
-      // `not-routable` is a retirement signal in its own right: the id is listed
-      // but every request would 404, so publishing it recreates the ghost.
-      if (listing.routeable === false || retired.has(listing.id)) continue;
-
-      const known = curatedById.get(listing.id);
-      if (known) {
-        // Curated normally outranks everything, but in donor AUTHORITY mode the
-        // donor is the source of truth and is applied last, to curated too.
-        out.push(finalize(known, { donor, retired }));
-        continue;
-      }
-      const previous = storedById.get(listing.id);
-      if (previous) {
-        // Already built in a past session; the funnel fills evidence-free fields
-        // that a previous session could not resolve either.
-        out.push(finalize(previous, { donor, retired }));
-        continue;
-      }
-      // Brand-new id: probe only what the gateway does not declare.
-      let probed: LiveModelConfig | undefined;
-      const probingEnabled = options.probe ?? truthyEnv(probeEnv);
-      if (probingEnabled && !probeTripped) {
-        probed = await probeNewModel(listing, baseUrl, key, ctx.signal);
-        if (probed) probeFailures = 0;
-        else if (++probeFailures >= PROBE_FAILURE_LIMIT) probeTripped = true;
-      }
-      if (ctx.signal.aborted) return undefined;
-      // A successful probe wins over the donor: it is a measurement ON this
-      // gateway. `applyDonor` only fills what the probe left as `vanilla`.
-      out.push(finalize(probed ?? gatewayModel(listing), { donor, retired }));
-    }
-
-    for (const alias of catalog.aliases) {
-      if (ctx.signal.aborted) return undefined;
-      const known = curatedById.get(alias.id);
-      if (known) {
-        out.push(finalize(known, { donor, retired }));
-        continue;
-      }
-      const previous = storedById.get(alias.id);
-      out.push(finalize(previous ?? aliasModel(alias, bounds), { donor, retired }));
-    }
-
-    const persisted = await ctx.publish({ persist: { models: out, checkedAt: Date.now() } });
-    if (!persisted || ctx.signal.aborted) return undefined;
-
-    // Maintenance-only, and only after publish so the catalog is never delayed.
-    if (truthyEnv(options.reprobeEnv ?? "PI_ENCLAVE_REPROBE")) {
-      await runReprobeAudit({
-        agentDir: options.agentDir,
-        baseUrl,
-        key,
-        signal: ctx.signal,
-        curated,
-        catalog,
-      });
-    }
-
-    return out;
+    if (ctx.signal.aborted) return undefined;
+    const ok = await ctx.publish({ persist: { models: out, checkedAt: Date.now() } });
+    return ok && !ctx.signal.aborted ? out : undefined;
   };
 }
