@@ -49,7 +49,9 @@
  */
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
@@ -94,6 +96,21 @@ export function bareName(id: string): string {
   return i === -1 ? id : id.slice(i + 1);
 }
 
+/**
+ * EnClave sells a model under a short name; a catalog lists the same weights
+ * under the dated slug the vendor publishes. These are the same model, so the
+ * dated slug is looked up when the short one finds nothing.
+ *
+ * Kept as data, not a rule: each line is a fact about one model, not a general
+ * "strip the date" heuristic. Stripping dates automatically would be wrong —
+ * `deepseek-v4-flash` and `deepseek-v4-flash-0731` are different checkpoints,
+ * and so is `qwen3.8-max` from `qwen3.8-max-0902`.
+ */
+export const NAME_ALIASES: Record<string, readonly string[]> = {
+  "qwen3.8-max": ["qwen3.8-max-0902"],
+  "nemotron-ultra": ["nemotron-3-ultra-550b-a55b"],
+};
+
 function num(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;
 }
@@ -110,23 +127,126 @@ function num(v: unknown): number | undefined {
  * sits under the pnpm store beneath the agent directory; this walks that store
  * rather than guessing a depth.
  */
-export function findBundledCatalogDir(agentDir: string): string | undefined {
-  const root = join(agentDir, "npm", "node_modules", ".pnpm");
-  let entries: string[];
+export interface CatalogLocation {
+  dir: string;
+  /** Which copy this is, for the report. */
+  origin: "pi install" | "global install";
+}
+
+function catalogAt(piAiPackage: string): string | undefined {
+  const candidate = join(dirname(piAiPackage), "dist", "providers", "data");
   try {
-    entries = readdirSync(root).filter((e) => e.startsWith("@earendil-works+pi-ai@"));
+    if (statSync(candidate).isDirectory()) return candidate;
   } catch {
     return undefined;
   }
-  for (const dir of entries) {
-    const candidate = join(root, dir, "node_modules", "@earendil-works", "pi-ai", "dist", "providers", "data");
+  return undefined;
+}
+
+/** Where the Pi package itself may live. Only used to resolve pi-ai. */
+function piPackageCandidates(): string[] {
+  const out = [
+    // Resolved from this process, which is Pi's own bundle when Pi loads us.
+    fileURLToPath(new URL("..", import.meta.url)),
+    "/usr/lib/node_modules/@earendil-works/pi-coding-agent",
+    "/usr/local/lib/node_modules/@earendil-works/pi-coding-agent",
+  ];
+  try {
+    out.push(dirname(dirname(process.execPath)) + "/../lib/node_modules/@earendil-works/pi-coding-agent");
+  } catch {
+    // execPath unavailable
+  }
+  return [...new Set(out.map((p) => resolve(p)))];
+}
+
+/**
+ * Find Pi's bundled catalogs without depending on a version or a hash.
+ *
+ * The directory is named `@earendil-works+pi-ai@<version>_<dependency hash>`, so
+ * any stored path dies on the next update. Only stable prefixes are used and the
+ * tree is searched at run time.
+ *
+ * Order matters, because there can be more than one copy of pi-ai and reading
+ * the wrong one fails silently:
+ *
+ *   1. ASK NODE. `createRequire` from Pi's own package resolves the exact pi-ai
+ *      that Pi loads its models from. That is ground truth, not a guess.
+ *   2. FALL BACK to the agent's pnpm store, which is where `pi install npm:…`
+ *      puts things on this device. When several versions sit there, the one whose
+ *      version matches Pi's package wins; otherwise the highest, never a `+` build.
+ *
+ * On this device step 1 currently fails: the global install of pi-ai is an empty
+ * directory, so Pi resolves it from the agent's store. Both steps are kept
+ * because either can be true after an update.
+ */
+export function findBundledCatalogs(agentDir: string): CatalogLocation[] {
+  const found: CatalogLocation[] = [];
+  const push = (dir: string | undefined, origin: CatalogLocation["origin"]) => {
+    if (dir && !found.some((f) => f.dir === dir)) found.push({ dir, origin });
+  };
+
+  for (const piPkg of piPackageCandidates()) {
     try {
-      if (statSync(candidate).isDirectory()) return candidate;
+      const require = createRequire(join(piPkg, "package.json"));
+      push(catalogAt(require.resolve("@earendil-works/pi-ai/package.json")), "la que usa Pi");
     } catch {
-      // try the next one
+      // Pi does not resolve pi-ai from here.
+    }
+  }
+
+  const store = join(agentDir, "npm", "node_modules", ".pnpm");
+  let entries: string[] = [];
+  try {
+    entries = readdirSync(store).filter((e) => e.startsWith("@earendil-works+pi-ai@"));
+  } catch {
+    entries = [];
+  }
+  const piVersion = piPackageVersion();
+  entries
+    .map((e) => ({ entry: e, version: e.slice("@earendil-works+pi-ai@".length).split("_")[0] }))
+    .filter((c) => !c.version.includes("+"))
+    .sort((a, b) => {
+      if (piVersion && a.version === piVersion) return -1;
+      if (piVersion && b.version === piVersion) return 1;
+      return compareVersions(b.version, a.version);
+    })
+    .forEach((c) => {
+      try {
+        push(catalogAt(join(store, c.entry, "node_modules", "@earendil-works", "pi-ai", "package.json")), "pi install");
+      } catch {
+        // not a usable copy
+      }
+    });
+
+  return found;
+}
+
+function piPackageVersion(): string | undefined {
+  for (const piPkg of piPackageCandidates()) {
+    try {
+      const pkg = JSON.parse(readFileSync(join(piPkg, "package.json"), "utf8")) as { version?: string };
+      if (pkg.version) return pkg.version;
+    } catch {
+      // try the next
     }
   }
   return undefined;
+}
+
+/** Numeric dotted comparison, so 0.9 sorts below 0.10. */
+function compareVersions(a: string, b: string): number {
+  const pa = a.split(".").map((n) => Number(n) || 0);
+  const pb = b.split(".").map((n) => Number(n) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+/** The catalogs to read, best location first. Never throws. */
+export function findBundledCatalogDir(agentDir: string): string | undefined {
+  return findBundledCatalogs(agentDir)[0]?.dir;
 }
 
 /** Provider ids that have a credential in `auth.json`. */
@@ -236,9 +356,18 @@ export function resolveModel(
   // different router, and its catalog numbers would be false here.
   if (isAlias) return { entry: {}, corroborating: [], rule: "none" };
 
+  // The exact name first; a dated slug only when the catalog does not know the
+  // short one.
+  const candidates = [bare, ...(NAME_ALIASES[bare] ?? [])];
   const knowing = bundled
-    .map((c) => ({ provider: c.provider, entry: c.models.get(bare) }))
-    .filter((h): h is { provider: string; entry: ModelEntry } => !!h.entry);
+    .map((c) => {
+      for (const name of candidates) {
+        const entry = c.models.get(name);
+        if (entry) return { provider: c.provider, entry };
+      }
+      return undefined;
+    })
+    .filter((h): h is { provider: string; entry: ModelEntry } => h !== undefined);
 
   // 1. The hand layer, when it has the model. It is the top authority; lower
   //    sources only get to correct it within the rounding band, where they are

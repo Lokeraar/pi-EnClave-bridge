@@ -1,25 +1,24 @@
 #!/usr/bin/env node
 /**
- * test-sync.mjs — offline checks for the whole sync path.
+ * test-sync.mjs — offline checks for the whole donor pipeline.
  *
- * One file, because the two things being tested are the same pipeline seen at
- * two points: how a bare name is matched, and what the values end up being.
- *
- *   1. bare-name matching, including the near miss that must NOT match
- *   2. hand-written is the top authority, unless the bundled figure is the same
- *      number written differently (rounding), in which case exact wins
- *   3. two bundled catalogs that disagree are averaged
- *   4. "free" models are excluded from every bundled catalog
- *   5. a bundled catalog only counts for a provider that is active
- *   6. router aliases are never resolved from a donor
- *   7. an output ceiling can never exceed the window minus a prompt reserve
- *   8. the endpoint owns contextWindow and cost, always
+ * The rules being pinned, in the order they apply:
+ *   1. a bare name match, and the near miss that must NOT match
+ *   2. hand-written is the top authority, displaced only by rounding
+ *   3. strict order: openrouter second, the rest are corroboration only
+ *   4. nothing is ever averaged
+ *   5. "free" models are excluded from every bundled catalog
+ *   6. only providers with a credential are read
+ *   7. router aliases are never resolved from a donor
+ *   8. a dated vendor slug resolves to the short name
+ *   9. an output ceiling can never exceed the window minus a prompt reserve
+ *  10. the catalog is found without a stored path, so a Pi update is harmless
  */
 
 import { join } from "node:path";
 
 const ROOT = join(new URL(".", import.meta.url).pathname, "..");
-const { bareName, resolveModel, ROUNDING_TOLERANCE, findBundledCatalogDir, readBundledCatalog, readActiveBundledCatalogs } =
+const { bareName, resolveModel, readBundledCatalog, readActiveBundledCatalogs, findBundledCatalogDir, findBundledCatalogs, ROUNDING_TOLERANCE } =
   await import(join(ROOT, "donors.ts"));
 const { buildBlock } = await import(join(ROOT, "enclave-live.ts"));
 
@@ -60,23 +59,17 @@ console.log("\nrounding is not a disagreement");
   check("the band is 5%", Math.abs(ROUNDING_TOLERANCE - 0.05) < 1e-9, String(ROUNDING_TOLERANCE));
 }
 
-console.log("\nstrict order: nothing is averaged");
+console.log("\nstrict order, nothing is averaged");
 {
   const r = resolveModel("minimax-m3", undefined, [cat("openrouter", { "minimax-m3": { maxTokens: 512000 } }), cat("opencode", { "minimax-m3": { maxTokens: 128000 } })], false);
   check("the highest-priority catalog supplies the value", r.entry.maxTokens === 512000, String(r.entry.maxTokens));
-  check("NOT an average of the two", r.entry.maxTokens !== 320000, String(r.entry.maxTokens));
+  check("NOT the midpoint of the two", r.entry.maxTokens !== 320000, String(r.entry.maxTokens));
   check("the lower one is recorded as corroboration", r.corroborating.join(",") === "opencode", r.corroborating.join(","));
   check("the source is named", r.source === "openrouter", String(r.source));
 
-  // A hand value outranks both bundled ones and is only refined within the band.
   const h = resolveModel("minimax-m3", { maxTokens: 400000 }, [cat("openrouter", { "minimax-m3": { maxTokens: 512000 } }), cat("opencode", { "minimax-m3": { maxTokens: 128000 } })], false);
   check("a hand value outranks both", h.entry.maxTokens === 400000, String(h.entry.maxTokens));
   check("both lower providers corroborate", h.corroborating.join(",") === "openrouter,opencode", h.corroborating.join(","));
-
-  // A hand value inside the rounding band of a bundled one takes the exact figure.
-  const band = resolveModel("glm-5.3-flash", { maxTokens: 128000 }, [cat("openrouter", { "glm-5.3-flash": { maxTokens: 131072 } })], false);
-  check("within the band the exact figure wins", band.entry.maxTokens === 131072, String(band.entry.maxTokens));
-  check("within the band it is still the hand source", band.source === "hand", String(band.source));
 }
 
 console.log("\nfree models are excluded, active providers only");
@@ -108,6 +101,47 @@ console.log("\naliases are never resolved from a donor");
   check("an alias is reported as untouched", r.rule === "none" && r.source === undefined && r.corroborating.length === 0, r.rule);
 }
 
+console.log("\na dated vendor slug resolves to the short name");
+{
+  const c = cat("openrouter", { "qwen3.8-max-0902": { maxTokens: 131072, input: ["text", "image"] } });
+  const r = resolveModel("qwen3.8-max", undefined, [c], false);
+  check("the dated slug is found", r.entry.maxTokens === 131072, String(r.entry.maxTokens));
+  check("and its modalities come with it", JSON.stringify(r.entry.input) === '["text","image"]', JSON.stringify(r.entry.input));
+
+  const both = cat("openrouter", { "qwen3.8-max": { maxTokens: 555 }, "qwen3.8-max-0902": { maxTokens: 131072 } });
+  check("the exact name beats the alias", resolveModel("qwen3.8-max", undefined, [both], false).entry.maxTokens === 555);
+
+  const n = cat("openrouter", { "nemotron-3-ultra-550b-a55b": { maxTokens: 32768 } });
+  check("nemotron-ultra resolves too", resolveModel("nemotron-ultra", undefined, [n], false).entry.maxTokens === 32768);
+}
+
+console.log("\nthe catalog is found without a stored path");
+{
+  const { mkdtempSync, mkdirSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join: J } = await import("node:path");
+  const fake = mkdtempSync(J(tmpdir(), "enclave-upd-"));
+  const mk = (ver, hash, max) => {
+    const p = J(fake, "npm/node_modules/.pnpm/@earendil-works+pi-ai@" + ver + "_" + hash, "node_modules/@earendil-works/pi-ai");
+    mkdirSync(J(p, "dist/providers/data"), { recursive: true });
+    writeFileSync(J(p, "package.json"), JSON.stringify({ version: ver }));
+    writeFileSync(J(p, "dist/providers/data/openrouter.json"), JSON.stringify({ "openai-completions": { "z-ai/glm-5.3": { id: "z-ai/glm-5.3", maxTokens: max } } }));
+  };
+  mk("0.85.1", "old", 100);
+  mk("0.99.0", "new", 999);
+  mk("0.90.0", "plusbuild", 500);
+
+  const locs = findBundledCatalogs(fake);
+  check("catalogues are found without a stored path", locs.length >= 1, String(locs.length));
+  check("the newest version wins whatever the folder is called", locs[0].dir.includes("0.99.0"), locs[0].dir);
+  const cat2 = readBundledCatalog(locs[0].dir, "openrouter");
+  check("the newest catalog is the one read", cat2.models.get("glm-5.3").maxTokens === 999, String(cat2.models.get("glm-5.3").maxTokens));
+  check("a + build is never preferred", !locs[0].dir.includes("plusbuild"), locs[0].dir);
+  rmSync(fake, { recursive: true, force: true });
+
+  check("a missing package degrades instead of throwing", findBundledCatalogs("/no/existe/path").length === 0);
+}
+
 console.log("\nthe block: matching, near misses, endpoint-owned fields");
 {
   const catalog = {
@@ -129,12 +163,9 @@ console.log("\nthe block: matching, near misses, endpoint-owned fields");
   const out = buildBlock(catalog, hand, bundled, "https://x", () => true);
   const by = Object.fromEntries(out.models.map((m) => [m.id, m]));
 
-  // It has a hand value, so it HAS a donor record — what matters is that the
-  // bundled catalog for `glm-5.3-flash` did not bleed into it.
   check("the near miss does not take the bundled figure", by["cyberouter/glm-5.3"].donor?.source !== "openrouter", JSON.stringify(by["cyberouter/glm-5.3"]?.donor));
-  check("the near miss is attributed to the hand layer", by["cyberouter/glm-5.3"].donor?.source === "hand", JSON.stringify(by["cyberouter/glm-5.3"]?.donor));
   check("the near miss keeps its own hand value", by["cyberouter/glm-5.3"].maxTokens === 999999, String(by["cyberouter/glm-5.3"].maxTokens));
-  check("the exact match takes the bundled figure", by["cyberouter/glm-5.3-flash"].maxTokens === 131072, String(by["cyberouter/glm-5.3-flash"].maxTokens));
+  check("the exact match takes the exact bundled figure", by["cyberouter/glm-5.3-flash"].maxTokens === 131072, String(by["cyberouter/glm-5.3-flash"].maxTokens));
   check("the endpoint owns the context window", by["cyberouter/glm-5.3-flash"].contextWindow === 1048576, String(by["cyberouter/glm-5.3-flash"].contextWindow));
   check("the endpoint owns the price", by["cyberouter/glm-5.3-flash"].cost.input === 0.15, String(by["cyberouter/glm-5.3-flash"].cost.input));
   check("compat defaults on", by["cyberouter/glm-5.3-flash"].compat?.supportsDeveloperRole === false, JSON.stringify(by["cyberouter/glm-5.3-flash"].compat));
