@@ -1,16 +1,27 @@
 #!/usr/bin/env node
 /**
- * test-sync.mjs — checks for the join that matters: bare model name.
+ * test-sync.mjs — offline checks for the whole sync path.
  *
- * Runs offline. The point of these is one specific thing that is easy to get
- * wrong and invisible when it is wrong — matching `cyberouter/glm-5.3-flash`
- * against `glm-5.3-flash`, and NOT against `glm-5.3`.
+ * One file, because the two things being tested are the same pipeline seen at
+ * two points: how a bare name is matched, and what the values end up being.
+ *
+ *   1. bare-name matching, including the near miss that must NOT match
+ *   2. hand-written is the top authority, unless the bundled figure is the same
+ *      number written differently (rounding), in which case exact wins
+ *   3. two bundled catalogs that disagree are averaged
+ *   4. "free" models are excluded from every bundled catalog
+ *   5. a bundled catalog only counts for a provider that is active
+ *   6. router aliases are never resolved from a donor
+ *   7. an output ceiling can never exceed the window minus a prompt reserve
+ *   8. the endpoint owns contextWindow and cost, always
  */
 
 import { join } from "node:path";
 
 const ROOT = join(new URL(".", import.meta.url).pathname, "..");
-const { bareName, buildBlock, donorIndex } = await import(join(ROOT, "enclave-live.ts"));
+const { bareName, resolveModel, ROUNDING_TOLERANCE, findBundledCatalogDir, readBundledCatalog, readActiveBundledCatalogs } =
+  await import(join(ROOT, "donors.ts"));
+const { buildBlock } = await import(join(ROOT, "enclave-live.ts"));
 
 let passed = 0;
 const failed = [];
@@ -24,70 +35,117 @@ const check = (name, cond, detail) => {
   }
 };
 
+const cat = (provider, models) => ({ provider, models: new Map(Object.entries(models)) });
+const agentDir = join(process.env.HOME ?? "", ".pi", "agent");
+
 console.log("\nbare name");
 check("strips a vendor prefix", bareName("cyberouter/glm-5.3") === "glm-5.3");
 check("leaves an unprefixed id alone", bareName("glm-5.3") === "glm-5.3");
 check("strips only the last segment", bareName("a/b/c") === "c");
 
-console.log("\njoin by bare name");
-const data = {
-  providers: {
-    opendesign: {
-      models: [
-        {
-          id: "deepseek-v4.1-flash",
-          reasoning: true,
-          thinkingLevelMap: { off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
-          input: ["text", "image"],
-          contextWindow: 1048000,
-          maxTokens: 232000,
-        },
-        { id: "glm-5.3-flash", thinkingLevelMap: { off: null, low: "low", high: "high", max: "max" }, maxTokens: 128000 },
-      ],
-    },
-  },
-};
-const donor = donorIndex(data);
+console.log("\nhand-written is the top authority");
+{
+  const r = resolveModel("glm-5.2", { maxTokens: 262144, input: ["text"] }, [cat("openrouter", { "glm-5.2": { maxTokens: 131072, input: ["text"] } })], false);
+  check("a large disagreement keeps the hand value", r.entry.maxTokens === 262144, String(r.entry.maxTokens));
+  check("and records that a hand value was used", r.sources.includes("hand"), r.sources.join(","));
+}
 
-const catalog = {
-  models: [
-    { id: "cyberouter/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", contextLength: 1048576, pricingPrompt: 0.3, pricingCompletion: 1.2, routeable: true },
-    // glm-5.3 is NOT glm-5.3-flash: a prefix relationship is not an identity.
-    { id: "cyberouter/glm-5.3", name: "GLM 5.3", contextLength: 1048576, pricingPrompt: 1.4, pricingCompletion: 4.4, routeable: true },
-    { id: "cyberouter/glm-5.3-flash", name: "GLM 5.3 Flash", contextLength: 1048576, pricingPrompt: 0.15, pricingCompletion: 0.5, routeable: true },
-    // listed but no healthy route for this key
-    { id: "cyberouter/dead", name: "Dead", contextLength: 262144, routeable: false },
-    { id: "cyberouter/orphan", name: "Orphan", contextLength: 262144, pricingPrompt: 1, pricingCompletion: 2, routeable: true },
-  ],
-  aliases: [{ id: "cyberouter/auto", task: null }],
-};
+console.log("\nrounding is not a disagreement");
+{
+  const far = resolveModel("deepseek-v4-flash", { maxTokens: 232000 }, [cat("openrouter", { "deepseek-v4-flash": { maxTokens: 384000 } })], false);
+  check("outside the band the hand value stays", far.entry.maxTokens === 232000, String(far.entry.maxTokens));
 
-const out = buildBlock(catalog, donor, [], "https://x", () => true);
-const by = Object.fromEntries(out.models.map((m) => [m.id, m]));
+  const close = resolveModel("glm-5.3-flash", { maxTokens: 128000 }, [cat("openrouter", { "glm-5.3-flash": { maxTokens: 131072 } })], false);
+  check("inside the band the exact bundled figure wins", close.entry.maxTokens === 131072, String(close.entry.maxTokens));
+  check("the band is 5%", Math.abs(ROUNDING_TOLERANCE - 0.05) < 1e-9, String(ROUNDING_TOLERANCE));
+}
 
-check("donor matched by bare name", out.fromDonor.includes("cyberouter/deepseek-v4.1-flash"), out.fromDonor.join(","));
-check("donor values copied wholesale", by["cyberouter/deepseek-v4.1-flash"].maxTokens === 232000, String(by["cyberouter/deepseek-v4.1-flash"].maxTokens));
-check("donor thinking map copied", by["cyberouter/deepseek-v4.1-flash"].thinkingLevelMap.xhigh === "xhigh");
-check("donor images copied", JSON.stringify(by["cyberouter/deepseek-v4.1-flash"].input) === '["text","image"]');
-check("gateway owns the context window", by["cyberouter/deepseek-v4.1-flash"].contextWindow === 1048576, String(by["cyberouter/deepseek-v4.1-flash"].contextWindow));
-check("gateway owns the price", by["cyberouter/deepseek-v4.1-flash"].cost.input === 0.3, String(by["cyberouter/deepseek-v4.1-flash"].cost.input));
+console.log("\ntwo bundled catalogs that disagree are averaged");
+{
+  const r = resolveModel("minimax-m3", undefined, [cat("openrouter", { "minimax-m3": { maxTokens: 512000 } }), cat("opencode", { "minimax-m3": { maxTokens: 128000 } })], false);
+  check("the midpoint is used", r.entry.maxTokens === 320000, String(r.entry.maxTokens));
+  check("the rule is reported as midpoint", r.rule === "midpoint", r.rule);
+  check("both sources are named", r.sources.join(",") === "openrouter,opencode", r.sources.join(","));
+}
 
-check("a near-miss name does NOT inherit", !out.fromDonor.includes("cyberouter/glm-5.3"), out.fromDonor.join(","));
-check("the near-miss is reported as pending", out.pending.includes("cyberouter/glm-5.3"), out.pending.join(","));
-check("glm-5.3-flash matched its own donor", out.fromDonor.includes("cyberouter/glm-5.3-flash"));
-check("a model with no route is excluded", !by["cyberouter/dead"]);
-check("the exclusion says why", out.skipped.find((s) => s.id === "cyberouter/dead")?.why.includes("ruta"), JSON.stringify(out.skipped));
+console.log("\nfree models are excluded, active providers only");
+{
+  const dir = findBundledCatalogDir(agentDir);
+  if (!dir) {
+    console.log("  --   catálogo bundled no encontrado, se omiten estas pruebas");
+  } else {
+    const or = readBundledCatalog(dir, "openrouter");
+    const oc = readBundledCatalog(dir, "opencode");
+    check("openrouter catalog loads", !!or && or.models.size > 300, String(or && or.models.size));
+    const anyFree = (c) => [...c.models.keys()].some((k) => /free/i.test(k));
+    check("no free id survives in openrouter", !anyFree(or));
+    check("no free id survives in opencode", !anyFree(oc));
+    const inkling = or.models.get("inkling");
+    check("the paid entry wins over its :free sibling", !!inkling && inkling.maxTokens !== undefined, JSON.stringify(inkling && inkling.id));
 
-check("compat defaults on", by["cyberouter/deepseek-v4.1-flash"].compat?.supportsDeveloperRole === false, JSON.stringify(by["cyberouter/deepseek-v4.1-flash"].compat));
-check("aliases are published", !!by["cyberouter/auto"]);
-check("alias context is the catalog floor", by["cyberouter/auto"].contextWindow === 262144, String(by["cyberouter/auto"].contextWindow));
-check("alias price is the catalog ceiling", by["cyberouter/auto"].cost.input === 1.4, String(by["cyberouter/auto"].cost.input));
+    const active = readActiveBundledCatalogs(agentDir, { exclude: ["EnClave"] });
+    const providers = active.map((c) => c.provider);
+    check("only active providers are read", !providers.includes("groq") && !providers.includes("fireworks"), providers.join(","));
+    check("configured providers are picked up", providers.includes("openrouter") && providers.includes("opencode"), providers.join(","));
+  }
+}
 
-console.log("\nexisting values are kept when there is no donor");
-const out2 = buildBlock(catalog, donor, [{ id: "cyberouter/orphan", reasoning: true, maxTokens: 999, thinkingLevelMap: { low: "low" } }], "https://x", () => true);
-check("existing maxTokens survives", by2(out2, "cyberouter/orphan").maxTokens === 999);
-function by2(result, id) {
-  return result.models.find((m) => m.id === id);
+console.log("\naliases are never resolved from a donor");
+{
+  const r = resolveModel("auto", { maxTokens: 999 }, [cat("openrouter", { auto: { maxTokens: 30000, contextWindow: 2000000 } })], true);
+  check("an alias yields no donor values", Object.keys(r.entry).length === 0, JSON.stringify(r.entry));
+  check("an alias is reported as untouched", r.rule === "none" && r.sources.length === 0, r.rule);
+}
+
+console.log("\nthe block: matching, near misses, endpoint-owned fields");
+{
+  const catalog = {
+    models: [
+      { id: "cyberouter/glm-5.3-flash", name: "GLM 5.3 Flash", contextLength: 1048576, pricingPrompt: 0.15, pricingCompletion: 0.5, routeable: true },
+      { id: "cyberouter/glm-5.3", name: "GLM 5.3", contextLength: 1048576, pricingPrompt: 1.4, pricingCompletion: 4.4, routeable: true },
+      { id: "cyberouter/inkling", name: "Inkling", contextLength: 262144, pricingPrompt: 1, pricingCompletion: 4, routeable: true },
+      { id: "cyberouter/dead", name: "Dead", contextLength: 262144, routeable: false },
+      { id: "cyberouter/orphan", name: "Orphan", contextLength: 262144, pricingPrompt: 1, pricingCompletion: 2, routeable: true },
+    ],
+    aliases: [{ id: "cyberouter/auto", task: null }],
+  };
+  const hand = new Map([
+    ["glm-5.3-flash", { maxTokens: 128000, thinkingLevelMap: { off: null, low: "low" } }],
+    ["glm-5.3", { maxTokens: 999999 }],
+  ]);
+  const bundled = [cat("openrouter", { "glm-5.3-flash": { maxTokens: 131072 }, inkling: { maxTokens: 471859 } })];
+
+  const out = buildBlock(catalog, hand, bundled, "https://x", () => true);
+  const by = Object.fromEntries(out.models.map((m) => [m.id, m]));
+
+  // It has a hand value, so it HAS a donor record — what matters is that the
+  // bundled catalog for `glm-5.3-flash` did not bleed into it.
+  check("the near miss does not take the bundled figure", by["cyberouter/glm-5.3"].donor?.sources.join(",") !== "openrouter", JSON.stringify(by["cyberouter/glm-5.3"]?.donor));
+  check("the near miss is attributed to the hand layer", by["cyberouter/glm-5.3"].donor?.sources.join(",") === "hand", JSON.stringify(by["cyberouter/glm-5.3"]?.donor));
+  check("the near miss keeps its own hand value", by["cyberouter/glm-5.3"].maxTokens === 999999, String(by["cyberouter/glm-5.3"].maxTokens));
+  check("the exact match takes the bundled figure", by["cyberouter/glm-5.3-flash"].maxTokens === 131072, String(by["cyberouter/glm-5.3-flash"].maxTokens));
+  check("the endpoint owns the context window", by["cyberouter/glm-5.3-flash"].contextWindow === 1048576, String(by["cyberouter/glm-5.3-flash"].contextWindow));
+  check("the endpoint owns the price", by["cyberouter/glm-5.3-flash"].cost.input === 0.15, String(by["cyberouter/glm-5.3-flash"].cost.input));
+  check("compat defaults on", by["cyberouter/glm-5.3-flash"].compat?.supportsDeveloperRole === false, JSON.stringify(by["cyberouter/glm-5.3-flash"].compat));
+  check("a model with no route is excluded", !by["cyberouter/dead"]);
+  check("the exclusion says why", out.skipped.find((s) => s.id === "cyberouter/dead")?.why.includes("ruta"), JSON.stringify(out.skipped));
+  check("a model with no donor is reported as pending", out.pending.includes("cyberouter/orphan"), out.pending.join(","));
+
+  check("aliases are published", !!by["cyberouter/auto"]);
+  check("alias context is the catalog floor", by["cyberouter/auto"].contextWindow === 262144, String(by["cyberouter/auto"].contextWindow));
+  check("alias price is the catalog ceiling", by["cyberouter/auto"].cost.input === 1.4, String(by["cyberouter/auto"].cost.input));
+  check("aliases carry no donor record", by["cyberouter/auto"].donor === undefined);
+
+  check("an impossible ceiling is clamped below the window", by["cyberouter/inkling"].maxTokens === 262144 - 2048, String(by["cyberouter/inkling"].maxTokens));
+  check("maxTokens is never null (Pi crashes formatting it)", out.models.every((m) => typeof m.maxTokens === "number"), "hay un null");
+}
+
+console.log("\nexisting values are kept when there is no donor at all");
+{
+  const catalog = { models: [{ id: "cyberouter/orphan", name: "Orphan", contextLength: 262144, pricingPrompt: 1, pricingCompletion: 2, routeable: true }], aliases: [] };
+  const hand = new Map([["orphan", { maxTokens: 999, thinkingLevelMap: { low: "low" } }]]);
+  const out = buildBlock(catalog, hand, [], "https://x", () => true);
+  check("the hand value survives", out.models[0].maxTokens === 999, String(out.models[0].maxTokens));
 }
 
 console.log(`\n${passed} passed, ${failed.length} failed`);

@@ -40,13 +40,14 @@ const {
   ENCLAVE_BASE_URL,
   PROVIDER_ID,
   buildBlock,
-  donorIndex,
   fetchCatalog,
+  handIndex,
   liveness,
   providerModels,
   readModelsJson,
   writeModelsJson,
 } = await import(join(ROOT, "enclave-live.ts"));
+const { findBundledCatalogDir, readActiveBundledCatalogs } = await import(join(ROOT, "donors.ts"));
 
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(n);
@@ -98,23 +99,55 @@ if (checkLive) {
   }
 }
 
-const donor = donorIndex(data);
-const existing = providerModels(data, PROVIDER_ID);
-const result = buildBlock(catalog, donor, existing, baseUrl, (id) => !dead.has(id));
+const hand = handIndex(data);
+// Pi's own bundled catalogs, for whichever providers are active. The directory
+// name carries the pi-ai version and a dependency hash, so it is discovered at
+// run time rather than stored.
+const catalogDir = findBundledCatalogDir(agentDir);
+const bundled = catalogDir ? readActiveBundledCatalogs(agentDir, { exclude: [PROVIDER_ID] }) : [];
+const result = buildBlock(catalog, hand, bundled, baseUrl, (id) => !dead.has(id));
+
+const short = (id) => id.replace(/^cyberouter\//, "");
+const byRule = (rule) => [...result.resolved.entries()].filter(([, r]) => r.rule === rule && r.sources.length);
 
 const report = [
   `EnClave — ${baseUrl}`,
-  `${result.models.length} publicables (${catalog.models.length} modelos + ${catalog.aliases.length} aliases en el catálogo)\n`,
-  `Del donante (${donor.size} disponibles): ${result.fromDonor.length}`,
-  ...result.fromDonor.map((id) => `  <- ${id.replace("cyberouter/", "")}`),
-  `\nSin donante, conservados tal cual: ${result.fromExisting.length}`,
-  ...result.fromExisting.map((id) => `  =  ${id.replace("cyberouter/", "")}`),
-  `\nSin donante y sin valores — trabajo a mano: ${result.pending.length}`,
-  ...result.pending.map((id) => `  ?  ${id.replace("cyberouter/", "")}`),
+  `${result.models.length} publicables (${catalog.models.length} modelos + ${catalog.aliases.length} aliases en el catálogo)`,
+  ``,
+  `Donantes disponibles:`,
+  `  a mano           ${hand.size} entradas en providers.opendesign`,
+  `  bundled          ${bundled.length} proveedores activos con catálogo: ${bundled.map((c) => c.provider).join(", ") || "ninguno"}`,
+  `  catálogo de Pi   ${catalogDir ?? "NO ENCONTRADO"}`,
+  ``,
+  `Resueltos desde un donante: ${[...result.resolved.values()].filter((r) => r.sources.length).length}`,
 ];
+
+const grouped = [
+  ["a mano (autoridad máxima)", byRule("hand")],
+  ["coincide con el bundled (redondeo)", byRule("exact")],
+  ["promedio entre bundled", byRule("midpoint")],
+];
+for (const [label, rows] of grouped) {
+  if (!rows.length) continue;
+  report.push(`\n  ${label}: ${rows.length}`);
+  for (const [id, r] of rows) report.push(`    ${short(id).padEnd(24)} ${r.sources.join(" + ")}`);
+}
+
+// Aliases are handled in their own loop, so they are reported separately rather
+// than looked for among the resolved models.
+const aliasIds = new Set(catalog.aliases.map((a) => a.id));
+const aliasesPublished = result.models.filter((m) => aliasIds.has(m.id));
+report.push(`\n  aliases publicados sin tocar (vanilla, a propósito): ${aliasesPublished.length}`);
+for (const a of aliasesPublished) report.push(`    ${short(a.id)}`);
+
+const pendingReal = result.pending.filter((id) => !aliasIds.has(id));
+if (pendingReal.length) {
+  report.push(`\nModelos sin donante y sin valores — trabajo a mano: ${pendingReal.length}`);
+  for (const id of pendingReal) report.push(`  ?  ${short(id)}`);
+}
 if (result.skipped.length) {
-  report.push(`\nExcluidos por no responder: ${result.skipped.length}`);
-  for (const s of result.skipped) report.push(`  x  ${s.id.replace("cyberouter/", "")}`);
+  report.push(`\nExcluidos: ${result.skipped.length}`);
+  for (const s of result.skipped) report.push(`  x  ${short(s.id).padEnd(24)} ${s.why}`);
 }
 report.push("");
 console.log(report.join("\n"));

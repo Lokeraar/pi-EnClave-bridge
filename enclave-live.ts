@@ -31,43 +31,23 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  type BundledCatalog,
+  type ModelEntry,
+  type Resolved,
+  bareName,
+  resolveModel,
+} from "./donors.ts";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 
-export interface ModelEntry {
-  id: string;
-  name?: string;
-  api?: string;
-  provider?: string;
-  reasoning?: boolean;
-  thinkingLevelMap?: ThinkingLevelMap;
-  input?: Array<"text" | "image">;
-  cost?: { input: number; output: number; cacheRead: number; cacheWrite: number };
-  contextWindow?: number;
-  maxTokens?: number;
-  compat?: Record<string, unknown>;
-  [key: string]: unknown;
-}
+export type { ModelEntry } from "./donors.ts";
 
 export const ENCLAVE_BASE_URL = "https://router.enclave.ai/v1";
 export const PROVIDER_ID = "EnClave";
 
-/** Fields copied from the donor. Deliberately not cost, and not the id. */
-const DONOR_FIELDS = [
-  "reasoning",
-  "thinkingLevelMap",
-  "input",
-  "contextWindow",
-  "maxTokens",
-  "compat",
-] as const;
-
-/** The model name with any `vendor/` prefix removed, on either side. */
-export function bareName(id: string): string {
-  const i = id.lastIndexOf("/");
-  return i === -1 ? id : id.slice(i + 1);
-}
+export { bareName } from "./donors.ts";
 
 // ---------------------------------------------------------------------------
 // models.json
@@ -89,8 +69,8 @@ export function providerModels(data: ModelsJson, provider: string): ModelEntry[]
   return data.providers?.[provider]?.models ?? [];
 }
 
-/** bare name -> donor entry. First definition wins. */
-export function donorIndex(data: ModelsJson, provider = "opendesign"): Map<string, ModelEntry> {
+/** bare name -> hand-written entry. First definition wins. */
+export function handIndex(data: ModelsJson, provider = "opendesign"): Map<string, ModelEntry> {
   const index = new Map<string, ModelEntry>();
   for (const m of providerModels(data, provider)) {
     const bare = bareName(m.id);
@@ -190,8 +170,8 @@ export async function liveness(
 
 export interface BuildResult {
   models: ModelEntry[];
-  fromDonor: string[];
-  fromExisting: string[];
+  /** id -> which donors contributed and by which rule, for the report. */
+  resolved: Map<string, Resolved>;
   pending: string[];
   skipped: Array<{ id: string; why: string }>;
 }
@@ -199,30 +179,43 @@ export interface BuildResult {
 const num = (v: unknown, fallback: number) => (typeof v === "number" && v > 0 ? v : fallback);
 
 /**
- * Build the EnClave model block from the live catalog, the donor and whatever
- * the EnClave block already says.
+ * Tokens held back from an output ceiling so the prompt has room. See the clamp
+ * in buildBlock.
+ */
+const PROMPT_RESERVE_TOKENS = 2_048;
+
+/** Aliases the router exposes: never resolved from a donor. See donors.ts. */
+function isAliasId(id: string, aliases: readonly CatalogAlias[]): boolean {
+  return aliases.some((a) => a.id === id);
+}
+
+/**
+ * Build the EnClave model block from the live catalog and every donor.
  *
- * @param alive pass a predicate that filters the live ids first, so callers can
- *   drop models that do not actually answer.
+ * Precedence, per field: the hand-written layer outranks a bundled catalog
+ * unless the two agree to within rounding, in which case the exact figure wins.
+ * `contextWindow` and `cost` are never taken from a donor — they describe this
+ * endpoint.
  */
 export function buildBlock(
   catalog: LiveCatalog,
-  donor: Map<string, ModelEntry>,
-  existing: readonly ModelEntry[],
+  hand: Map<string, ModelEntry>,
+  bundled: readonly BundledCatalog[],
   baseUrl: string,
   alive: (id: string) => boolean = () => true,
 ): BuildResult {
-  const existingByBare = new Map(existing.map((m) => [bareName(m.id), m]));
   const models: ModelEntry[] = [];
-  const fromDonor: string[] = [];
-  const fromExisting: string[] = [];
+  const resolved = new Map<string, Resolved>();
   const pending: string[] = [];
   const skipped: Array<{ id: string; why: string }> = [];
 
+  const contexts = catalog.models.map((m) => m.contextLength).filter((c): c is number => !!c);
+  const pricesIn = catalog.models.map((m) => m.pricingPrompt).filter((c): c is number => !!c);
+  const pricesOut = catalog.models.map((m) => m.pricingCompletion).filter((c): c is number => !!c);
+
   for (const listing of catalog.models) {
     // routeable_endpoint_count 0 means the catalog lists it but this key has no
-    // healthy route: every request 404s. Offering it would be the ghost-model
-    // bug, so the catalog's own health field is enough to exclude it.
+    // healthy route: every request 404s.
     if (!listing.routeable) {
       skipped.push({ id: listing.id, why: "sin ruta para esta clave" });
       continue;
@@ -231,67 +224,74 @@ export function buildBlock(
       skipped.push({ id: listing.id, why: "no responde" });
       continue;
     }
+
     const bare = bareName(listing.id);
+    const isAlias = isAliasId(listing.id, catalog.aliases);
+    const r = resolveModel(bare, hand.get(bare), bundled, isAlias);
+    resolved.set(listing.id, r);
+    if (!r.sources.length) pending.push(listing.id);
+
     const entry: ModelEntry = {
+      ...r.entry,
       id: listing.id,
       name: listing.name ?? listing.id,
-      reasoning: true,
-      thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-      input: ["text"],
-      contextWindow: num(listing.contextLength, 128_000),
-      maxTokens: 16_384,
-      // The donor carries no per-model compat (it keeps its own at provider
-      // level), and this block REPLACES rather than merges, so without a
-      // default here the flag is silently dropped. Pi then sends
-      // role:"developer", which this gateway rejects with
+      reasoning: r.entry.reasoning ?? true,
+      thinkingLevelMap:
+        r.entry.thinkingLevelMap ??
+        { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
+      input: r.entry.input ?? ["text"],
+      // The donor carries no per-model compat, and this block REPLACES rather
+      // than merges, so a default is required. Without it Pi sends
+      // role:"developer" and every request fails with
       //   messages.0.role: Invalid option: expected one of
       //   "system"|"user"|"assistant"|"tool"
-      // Set before the donor copy, so a donor that does declare compat wins.
-      compat: { supportsDeveloperRole: false },
+      compat: r.entry.compat ?? { supportsDeveloperRole: false },
+      // A donor may simply not state an output ceiling. `num` turns that into a
+      // conservative default rather than leaving `undefined`, which would reach
+      // Pi as null and fail schema validation.
+      //
+      // Clamped to the window MINUS a prompt reserve, because an output ceiling
+      // larger than what the context can hold is not a bigger claim, it is an
+      // impossible one. EnClave rejects it outright:
+      //   "This request needs about N tokens (messages + tools + max_tokens)"
+      // so the ceiling is the window minus whatever the prompt occupies. The
+      // reserve is deliberately coarse (2048) because the prompt size is not
+      // knowable here and the cost of being too generous is a rejected request,
+      // while the cost of reserving too little is only headroom.
+      //
+      // Note the clamp can never EQUAL the window either: measured on inkling,
+      // 262,144 was rejected while 261,120 passed. OpenRouter lists that same
+      // model at 471,859 against a 262,144 window here, so this is not
+      // hypothetical. A value inside the limit is used exactly as given — the
+      // clamp removes impossibilities, it does not second-guess the donor.
+      maxTokens: Math.min(
+        num(r.entry.maxTokens, 16_384),
+        Math.max(1_024, num(listing.contextLength, 128_000) - PROMPT_RESERVE_TOKENS),
+      ),
+      // The endpoint owns these two.
+      contextWindow: num(listing.contextLength, 128_000),
+      cost: {
+        input: listing.pricingPrompt ?? 0,
+        output: listing.pricingCompletion ?? 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+      },
+      api: "openai-completions",
+      donor: r.sources.length ? { sources: r.sources, rule: r.rule === "none" ? "hand" : r.rule } : undefined,
     };
-
-    const from = donor.get(bare);
-    if (from) {
-      for (const f of DONOR_FIELDS) if (from[f] !== undefined) entry[f] = from[f] as never;
-      fromDonor.push(listing.id);
-    } else {
-      const was = existingByBare.get(bare);
-      if (was) {
-        for (const f of DONOR_FIELDS) if (was[f] !== undefined) entry[f] = was[f] as never;
-        fromExisting.push(listing.id);
-      } else {
-        pending.push(listing.id);
-      }
-    }
-
-    // The gateway owns these two: they are facts about this endpoint.
-    if (listing.contextLength) entry.contextWindow = listing.contextLength;
-    entry.cost = {
-      input: listing.pricingPrompt ?? 0,
-      output: listing.pricingCompletion ?? 0,
-      cacheRead: 0,
-      cacheWrite: 0,
-    };
-    entry.api = "openai-completions";
     models.push(entry);
   }
 
   // Router aliases: usable as a model, but their window and price depend on
   // which concrete model the router picks per request, so both are bounded
   // rather than guessed — context at the catalog floor, price at the ceiling.
-  const contexts = catalog.models.map((m) => m.contextLength).filter((c): c is number => !!c);
-  const pricesIn = catalog.models.map((m) => m.pricingPrompt).filter((c): c is number => !!c);
-  const pricesOut = catalog.models.map((m) => m.pricingCompletion).filter((c): c is number => !!c);
+  // Left vanilla on purpose: the same bare name is a different thing elsewhere.
   for (const alias of catalog.aliases) {
     if (!alive(alias.id)) {
       skipped.push({ id: alias.id, why: "no responde" });
       continue;
     }
-    const bare = bareName(alias.id);
-    const from = donor.get(bare) ?? existingByBare.get(bare);
     models.push({
-      compat: { supportsDeveloperRole: false },
-      ...(from ? Object.fromEntries(DONOR_FIELDS.filter((f) => from[f] !== undefined).map((f) => [f, from[f]])) : {}),
       id: alias.id,
       name: alias.id,
       api: "openai-completions",
@@ -300,6 +300,7 @@ export function buildBlock(
       input: ["text"],
       contextWindow: contexts.length ? Math.min(...contexts) : 128_000,
       maxTokens: 16_384,
+      compat: { supportsDeveloperRole: false },
       cost: {
         input: pricesIn.length ? Math.max(...pricesIn) : 0,
         output: pricesOut.length ? Math.max(...pricesOut) : 0,
@@ -309,7 +310,7 @@ export function buildBlock(
     });
   }
 
-  return { models, fromDonor, fromExisting, pending, skipped };
+  return { models, resolved, pending, skipped };
 }
 
 // ---------------------------------------------------------------------------
