@@ -1,51 +1,56 @@
 /**
- * donors.ts — every source of model values, in one readable place.
+ * donors.ts — where model values come from.
  *
- * A "donor" is some other list of models whose values we can copy onto ours,
- * matched on the BARE model name: the id with any `vendor/` prefix stripped on
- * both sides, so `cyberouter/glm-5.3-flash` matches `glm-5.3-flash`.
+ * A "donor" is a list of models whose values can be copied onto ours, matched on
+ * the BARE model name: the id with any `vendor/` prefix stripped on both sides,
+ * so `cyberouter/glm-5.3-flash` matches `glm-5.3-flash`. A prefix relationship is
+ * not an identity: `cyberouter/glm-5.3` does not inherit from `glm-5.3-flash`.
  *
- * There are two kinds, and they are NOT equal in authority.
+ * ## One source, and it ships with Pi
  *
- *   1. HAND-WRITTEN — `providers.opendesign` in `models.json`. A person chose
- *      those numbers. This is the top authority, full stop. A rounded hand
- *      value stays.
+ * The donor is the catalog Pi bundles inside its own package:
  *
- *   2. BUNDLED — the catalogs Pi ships inside its own package, at
- *      `pi-ai/dist/providers/data/<provider>.json`. Pi rewrites them on every
- *      update, they cover 39 providers, and they are the only donors available
- *      for a provider nobody has configured by hand. These are consulted only
- *      for providers that are ACTIVE (a credential exists in `auth.json`),
- *      because an inactive provider's models are not reachable anyway.
+ *     pi-ai/dist/providers/data/<provider>.json
  *
- * They are consulted in a strict order, and the first one that knows the model
- * supplies its values:
+ * There is no hand-written donor and none is required. A list maintained by a
+ * person goes stale, and making every user own an account with an obscure
+ * provider before the extension does anything useful is a dependency nobody
+ * should have to accept. These files are already on disk after installing Pi,
+ * and reading a file needs no credential — a key is only needed to CALL an API,
+ * not to read what Pi shipped.
  *
- *     hand-written  >  openrouter  >  every other active provider
+ *     openrouter  the primary donor. It is the largest model router in the world
+ *                 and the catalog is its core business, so the numbers are kept
+ *                 by people who cannot afford to be wrong.
+ *     the rest    corroboration only. A provider lower in the order confirms the
+ *                 model exists and agrees on its structure; it fills a field the
+ *                 ones above left empty and never overrides.
  *
- * OpenRouter ranks second because it is the largest model router and its
- * catalog is its core business, maintained for years. The rest are NOT
- * competing sources: they corroborate. A provider lower in the order only fills
- * a field the ones above it left empty, and is otherwise reported as agreement.
- * Nothing is ever averaged — a number nobody published is not a consensus, it
- * is an invention.
+ * ## The order
  *
- * A hand value AGREES with a lower-priority one when it is within
- * `ROUNDING_TOLERANCE` (the hand value was rounded by a person, so `128_000`
- * and `131_072` are the same number written differently). The exact figure then
- * wins, because it is the same number with more precision. Outside that band
- * they genuinely differ, and the hand value stands.
+ *     what is already in models.json  >  openrouter  >  the rest
  *
- * Two things are never copied from any donor, because they describe the
- * endpoint rather than the model:
+ * What is already written wins, because it is specific to this endpoint. Inside
+ * a 5% band the bundled figure takes over, since `128_000` and `131_072` are the
+ * same number written differently and the second is the exact one. Outside that
+ * band they genuinely disagree and what is written stands. Nothing is ever
+ * averaged: a number nobody published is not a consensus, it is an invention.
  *
- *   contextWindow — the live catalog states what it actually serves
+ * ## What no donor may set
+ *
+ *   contextWindow — the live catalog states what this endpoint actually serves
  *   cost          — a donor's price is for a different reseller
+ *   compat        — OpenRouter's `thinkingFormat: "openrouter"` and friends
+ *                   describe how OpenRouter wants reasoning sent. EnClave speaks
+ *                   the OpenAI shape, which is how it was verified. Copying
+ *                   those flags would change the request format on an endpoint
+ *                   they were never tested against.
  *
- * And one class of id is never copied onto: ROUTER ALIASES. `cyberouter/auto`
- * is EnClave's own pseudo-model; OpenRouter's `auto` is a different thing that
- * happens to share the name, and it advertises a 2,000,000 window that would be
- * a lie here. Aliases stay vanilla.
+ * ## Router aliases are never resolved
+ *
+ * `cyberouter/auto` is EnClave's own pseudo-model. OpenRouter has an `auto` too,
+ * advertising a 2,000,000 window — a different thing that happens to share the
+ * name, and a lie here.
  */
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
@@ -71,18 +76,15 @@ export interface ModelEntry {
    * Set by the sync script. `source` supplied the values; `corroborating`
    * lists the other providers that also know the model and agree it exists.
    */
-  donor?: { source: string; corroborating: string[]; rule: "hand" | "exact" | "corroborated" | "none" };
+  donor?: { source: string; corroborating: string[]; rule: "kept" | "exact" | "corroborated" | "none" };
   [key: string]: unknown;
 }
 
-/** Fields a donor may contribute. */
-export const DONOR_FIELDS = [
-  "reasoning",
-  "thinkingLevelMap",
-  "input",
-  "maxTokens",
-  "compat",
-] as const;
+/** Fields a bundled donor may contribute. `compat` is deliberately absent. */
+export const BUNDLED_FIELDS = ["reasoning", "thinkingLevelMap", "input", "maxTokens"] as const;
+
+/** Fields already written in models.json may contribute, `compat` included. */
+export const HAND_FIELDS = [...BUNDLED_FIELDS, "compat"] as const;
 
 /**
  * How close a hand-written value must be to a bundled one to count as the same
@@ -318,9 +320,38 @@ export function readBundledCatalog(
 }
 
 /** Every bundled catalog belonging to an active provider, free ids removed. */
-export function readActiveBundledCatalogs(
-  agentDir: string,
-  options: { exclude?: readonly string[] } = {},
+/**
+ * Every catalog Pi ships, best donor first.
+ *
+ * No credential is required and none is asked for: these files are data Pi
+ * already installed. OpenRouter leads because it is the primary donor; the rest
+ * are corroboration.
+ */
+export function readPiCatalogs(agentDir: string, options: { exclude?: readonly string[] } = {}): BundledCatalog[] {
+  const dir = findBundledCatalogDir(agentDir);
+  if (!dir) return [];
+  const skip = new Set(options.exclude ?? []);
+  let files: string[] = [];
+  try {
+    files = readdirSync(dir).filter((f) => f.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  const out: BundledCatalog[] = [];
+  for (const file of files) {
+    const provider = file.slice(0, -".json".length);
+    if (skip.has(provider)) continue;
+    const catalog = readBundledCatalog(dir, provider);
+    if (catalog && catalog.models.size) out.push(catalog);
+  }
+  const rank = (p: string) => {
+    const i = PROVIDER_PRIORITY.indexOf(p as (typeof PROVIDER_PRIORITY)[number]);
+    return i === -1 ? PROVIDER_PRIORITY.length : i;
+  };
+  return out.sort((a, b) => rank(a.provider) - rank(b.provider) || a.provider.localeCompare(b.provider));
+}
+
+/**
 ): BundledCatalog[] {
   const dir = findBundledCatalogDir(agentDir);
   if (!dir) return [];
@@ -348,7 +379,7 @@ export function readActiveBundledCatalogs(
  * Which provider's catalog outranks which. Anything not listed falls after
  * these, in the order they appear in auth.json.
  */
-export const PROVIDER_PRIORITY = ["opendesign", "openrouter"] as const;
+export const PROVIDER_PRIORITY = ["openrouter"] as const;
 
 export interface Resolved {
   entry: ModelEntry;
@@ -356,7 +387,7 @@ export interface Resolved {
   source?: string;
   /** Every other provider that also knows this model: corroboration only. */
   corroborating: string[];
-  rule: "hand" | "exact" | "corroborated" | "none";
+  rule: "kept" | "exact" | "corroborated" | "none";
 }
 
 const withinTolerance = (a: number, b: number) =>
@@ -374,7 +405,7 @@ const withinTolerance = (a: number, b: number) =>
  */
 export function resolveModel(
   bare: string,
-  hand: ModelEntry | undefined,
+  kept: ModelEntry | undefined,
   bundled: readonly BundledCatalog[],
   isAlias: boolean,
 ): Resolved {
@@ -382,8 +413,8 @@ export function resolveModel(
   // different router, and its catalog numbers would be false here.
   if (isAlias) return { entry: {}, corroborating: [], rule: "none" };
 
-  // The exact name first; a dated slug only when the catalog does not know the
-  // short one.
+  // The exact name first; a dated vendor slug only when the catalog does not
+  // know the short one.
   const candidates = [bare, ...(NAME_ALIASES[bare] ?? [])];
   const knowing = bundled
     .map((c) => {
@@ -395,36 +426,38 @@ export function resolveModel(
     })
     .filter((h): h is { provider: string; entry: ModelEntry } => h !== undefined);
 
-  // 1. The hand layer, when it has the model. It is the top authority; lower
-  //    sources only get to correct it within the rounding band, where they are
-  //    the same number with more precision.
-  if (hand) {
-    const entry = copyFields(hand);
-    const corroborating = knowing.map((h) => h.provider);
-    for (const { provider, entry: b } of knowing) {
-      for (const field of DONOR_FIELDS) {
+  // 1. Values already written are specific to this endpoint, so they stand. A
+  //    bundled figure only takes over inside the rounding band, and only for
+  //    fields a donor may touch, which excludes `compat`.
+  if (kept) {
+    const entry = copyFields(kept, HAND_FIELDS);
+    for (const { entry: b } of knowing) {
+      for (const field of BUNDLED_FIELDS) {
         const bundledValue = b[field];
         if (bundledValue === undefined) continue;
-        const handValue = entry[field];
-        if (handValue === undefined) {
-          (entry as Record<string, unknown>)[field] = bundledValue; // gap the hand layer left open
+        const keptValue = entry[field];
+        if (keptValue === undefined) {
+          (entry as Record<string, unknown>)[field] = bundledValue;
           continue;
         }
-        if (typeof handValue === "number" && typeof bundledValue === "number" && withinTolerance(handValue, bundledValue)) {
-          (entry as Record<string, unknown>)[field] = bundledValue; // same number, exact wins
+        if (typeof keptValue === "number" && typeof bundledValue === "number" && withinTolerance(keptValue, bundledValue)) {
+          (entry as Record<string, unknown>)[field] = bundledValue;
         }
-        // Otherwise the values genuinely differ and the hand value stands.
       }
-      void provider;
     }
-    return { entry, source: "hand", corroborating, rule: corroborating.length ? "corroborated" : "hand" };
+    return {
+      entry,
+      source: "models.json",
+      corroborating: knowing.map((h) => h.provider),
+      rule: knowing.length ? "corroborated" : "kept",
+    };
   }
 
-  // 2. No hand entry: the highest-priority bundled catalog that knows it.
+  // 2. Nothing written yet: the highest-priority catalog that knows the model.
   if (knowing.length) {
     const [first, ...rest] = knowing;
     return {
-      entry: copyFields(first.entry),
+      entry: copyFields(first.entry, BUNDLED_FIELDS),
       source: first.provider,
       corroborating: rest.map((h) => h.provider),
       rule: "exact",
@@ -434,9 +467,9 @@ export function resolveModel(
   return { entry: {}, corroborating: [], rule: "none" };
 }
 
-function copyFields(from: ModelEntry): ModelEntry {
+function copyFields(from: ModelEntry, fields: readonly string[]): ModelEntry {
   const out: ModelEntry = {};
-  for (const field of DONOR_FIELDS) {
+  for (const field of fields) {
     if (from[field] !== undefined) (out as Record<string, unknown>)[field] = from[field];
   }
   return out;

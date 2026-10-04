@@ -18,7 +18,7 @@
 import { join } from "node:path";
 
 const ROOT = join(new URL(".", import.meta.url).pathname, "..");
-const { bareName, resolveModel, readBundledCatalog, readActiveBundledCatalogs, findBundledCatalogDir, findBundledCatalogs, ROUNDING_TOLERANCE } =
+const { bareName, resolveModel, readBundledCatalog, readPiCatalogs, findBundledCatalogDir, findBundledCatalogs, ROUNDING_TOLERANCE } =
   await import(join(ROOT, "donors.ts"));
 const { buildBlock } = await import(join(ROOT, "enclave-live.ts"));
 
@@ -42,17 +42,17 @@ check("strips a vendor prefix", bareName("cyberouter/glm-5.3") === "glm-5.3");
 check("leaves an unprefixed id alone", bareName("glm-5.3") === "glm-5.3");
 check("strips only the last segment", bareName("a/b/c") === "c");
 
-console.log("\nhand-written is the top authority");
+console.log("\nwhat is already written is the top authority");
 {
   const r = resolveModel("glm-5.2", { maxTokens: 262144, input: ["text"] }, [cat("openrouter", { "glm-5.2": { maxTokens: 131072, input: ["text"] } })], false);
-  check("a large disagreement keeps the hand value", r.entry.maxTokens === 262144, String(r.entry.maxTokens));
-  check("and records that a hand value was used", r.source === "hand", String(r.source));
+  check("a large disagreement keeps what is written", r.entry.maxTokens === 262144, String(r.entry.maxTokens));
+  check("and it is attributed to models.json", r.source === "models.json", String(r.source));
 }
 
 console.log("\nrounding is not a disagreement");
 {
   const far = resolveModel("deepseek-v4-flash", { maxTokens: 232000 }, [cat("openrouter", { "deepseek-v4-flash": { maxTokens: 384000 } })], false);
-  check("outside the band the hand value stays", far.entry.maxTokens === 232000, String(far.entry.maxTokens));
+  check("outside the band what is written stays", far.entry.maxTokens === 232000, String(far.entry.maxTokens));
 
   const close = resolveModel("glm-5.3-flash", { maxTokens: 128000 }, [cat("openrouter", { "glm-5.3-flash": { maxTokens: 131072 } })], false);
   check("inside the band the exact bundled figure wins", close.entry.maxTokens === 131072, String(close.entry.maxTokens));
@@ -68,11 +68,11 @@ console.log("\nstrict order, nothing is averaged");
   check("the source is named", r.source === "openrouter", String(r.source));
 
   const h = resolveModel("minimax-m3", { maxTokens: 400000 }, [cat("openrouter", { "minimax-m3": { maxTokens: 512000 } }), cat("opencode", { "minimax-m3": { maxTokens: 128000 } })], false);
-  check("a hand value outranks both", h.entry.maxTokens === 400000, String(h.entry.maxTokens));
+  check("what is written outranks both", h.entry.maxTokens === 400000, String(h.entry.maxTokens));
   check("both lower providers corroborate", h.corroborating.join(",") === "openrouter,opencode", h.corroborating.join(","));
 }
 
-console.log("\nfree models are excluded, active providers only");
+console.log("\nfree models are excluded, no credential needed");
 {
   const dir = findBundledCatalogDir(agentDir);
   if (!dir) {
@@ -87,10 +87,11 @@ console.log("\nfree models are excluded, active providers only");
     const inkling = or.models.get("inkling");
     check("the paid entry wins over its :free sibling", !!inkling && inkling.maxTokens !== undefined, JSON.stringify(inkling && inkling.id));
 
-    const active = readActiveBundledCatalogs(agentDir, { exclude: ["EnClave"] });
-    const providers = active.map((c) => c.provider);
-    check("only active providers are read", !providers.includes("groq") && !providers.includes("fireworks"), providers.join(","));
-    check("configured providers are picked up", providers.includes("openrouter") && providers.includes("opencode"), providers.join(","));
+    const cats = readPiCatalogs(agentDir, { exclude: ["EnClave"] });
+    const providers = cats.map((c) => c.provider);
+    check("every catalog Pi ships is read, credential or not", providers.length > 30, String(providers.length));
+    check("openrouter leads as the primary donor", providers[0] === "openrouter", providers.slice(0, 3).join(","));
+    check("opencode is available even without an account", providers.includes("opencode"), "falta opencode");
   }
 }
 

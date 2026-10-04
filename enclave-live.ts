@@ -69,8 +69,8 @@ export function providerModels(data: ModelsJson, provider: string): ModelEntry[]
   return data.providers?.[provider]?.models ?? [];
 }
 
-/** bare name -> hand-written entry. First definition wins. */
-export function handIndex(data: ModelsJson, provider = "opendesign"): Map<string, ModelEntry> {
+/** bare name -> the values already written for that model. First wins. */
+export function keptIndex(data: ModelsJson, provider = PROVIDER_ID): Map<string, ModelEntry> {
   const index = new Map<string, ModelEntry>();
   for (const m of providerModels(data, provider)) {
     const bare = bareName(m.id);
@@ -199,7 +199,7 @@ function isAliasId(id: string, aliases: readonly CatalogAlias[]): boolean {
  */
 export function buildBlock(
   catalog: LiveCatalog,
-  hand: Map<string, ModelEntry>,
+  kept: Map<string, ModelEntry>,
   bundled: readonly BundledCatalog[],
   baseUrl: string,
   alive: (id: string) => boolean = () => true,
@@ -227,7 +227,7 @@ export function buildBlock(
 
     const bare = bareName(listing.id);
     const isAlias = isAliasId(listing.id, catalog.aliases);
-    const r = resolveModel(bare, hand.get(bare), bundled, isAlias);
+    const r = resolveModel(bare, kept.get(bare), bundled, isAlias);
     resolved.set(listing.id, r);
     if (!r.source) pending.push(listing.id);
 
@@ -278,7 +278,7 @@ export function buildBlock(
       },
       api: "openai-completions",
       donor: r.source
-        ? { source: r.source, corroborating: r.corroborating, rule: r.rule === "none" ? "hand" : r.rule }
+        ? { source: r.source, corroborating: r.corroborating, rule: r.rule === "none" ? "kept" : r.rule }
         : undefined,
     };
     models.push(entry);

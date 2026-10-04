@@ -41,13 +41,13 @@ const {
   PROVIDER_ID,
   buildBlock,
   fetchCatalog,
-  handIndex,
+  keptIndex,
   liveness,
   providerModels,
   readModelsJson,
   writeModelsJson,
 } = await import(join(ROOT, "enclave-live.ts"));
-const { findBundledCatalogDir, readActiveBundledCatalogs } = await import(join(ROOT, "donors.ts"));
+const { findBundledCatalogDir, readPiCatalogs } = await import(join(ROOT, "donors.ts"));
 
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(n);
@@ -99,13 +99,13 @@ if (checkLive) {
   }
 }
 
-const hand = handIndex(data);
+const kept = keptIndex(data);
 // Pi's own bundled catalogs, for whichever providers are active. The directory
 // name carries the pi-ai version and a dependency hash, so it is discovered at
 // run time rather than stored.
 const catalogDir = findBundledCatalogDir(agentDir);
-const bundled = catalogDir ? readActiveBundledCatalogs(agentDir, { exclude: [PROVIDER_ID] }) : [];
-const result = buildBlock(catalog, hand, bundled, baseUrl, (id) => !dead.has(id));
+const bundled = catalogDir ? readPiCatalogs(agentDir, { exclude: [PROVIDER_ID] }) : [];
+const result = buildBlock(catalog, kept, bundled, baseUrl, (id) => !dead.has(id));
 
 const short = (id) => id.replace(/^cyberouter\//, "");
 const byRule = (rule) => [...result.resolved.entries()].filter(([, r]) => r.rule === rule && r.source);
@@ -115,25 +115,29 @@ const report = [
   `${result.models.length} publicables (${catalog.models.length} modelos + ${catalog.aliases.length} aliases en el catálogo)`,
   ``,
   `Donantes disponibles:`,
-  `  a mano           ${hand.size} entradas en providers.opendesign`,
-  `  bundled          ${bundled.length} proveedores activos con catálogo: ${bundled.map((c) => c.provider).join(", ") || "ninguno"}`,
+  `  ya escrito       ${kept.size} entradas en providers.EnClave`,
+  `  catálogos de Pi  ${bundled.length} leídos: ${bundled.slice(0, 6).map((c) => c.provider).join(", ")}${bundled.length > 6 ? " …" : ""}`,
   `  catálogo de Pi   ${catalogDir ?? "NO ENCONTRADO"}`,
   ``,
   `Resueltos desde un donante: ${[...result.resolved.values()].filter((r) => r.source).length}`,
   ``,
-  `Orden de autoridad: escrito a mano > openrouter > el resto de los activos`,
+  `Orden de autoridad: ya escrito > openrouter > el resto de los catálogos de Pi`,
 ];
 
 const grouped = [
-  ["a mano (autoridad máxima), con confirmación de otro proveedor", byRule("corroborated")],
-  ["a mano (autoridad máxima)", byRule("hand")],
-  ["providers activos (sin valor a mano)", byRule("exact")],
+  ["ya escrito en models.json, confirmado por un catálogo", byRule("corroborated")],
+  ["ya escrito en models.json", byRule("kept")],
+  ["catálogo de Pi (sin valor previo)", byRule("exact")],
 ];
 for (const [label, rows] of grouped) {
   if (!rows.length) continue;
   report.push(`\n  ${label}: ${rows.length}`);
   for (const [id, r] of rows) {
-    const corr = r.corroborating.length ? `   confirmado por: ${r.corroborating.join(", ")}` : "";
+    // Confirmar con 42 catálogos no es información: es ruido. Con 3 alcanza.
+    const n = r.corroborating.length;
+    const shown = r.corroborating.slice(0, 3).join(", ");
+    const more = n > 3 ? ` +${n - 3} más` : "";
+    const corr = n ? `   confirmado por ${n}: ${shown}${more}` : "";
     report.push(`    ${short(id).padEnd(24)} ${r.source ?? "-"}${corr}`);
   }
 }
