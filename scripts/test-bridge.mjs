@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const HERE = new URL(".", import.meta.url).pathname;
+const fsRead = (p) => readFileSync(p, "utf8");
 const ROOT = join(HERE, "..");
 const { makeRefreshModels, readRetiredLedgerState } = await import(join(ROOT, "enclave-live.ts"));
 
@@ -558,6 +559,78 @@ console.log("\n8. Upstream-gone needs repeated, time-separated evidence");
   rmSync(snapDir, { recursive: true, force: true });
 
   rmSync(dir, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------- 9. every path through the funnel
+console.log("\n9. Offline and live must publish the SAME values");
+{
+  const { finalize, finalizeAll, buildStaticCatalog, buildDonorIndex, readDonorConfig } = await import(join(ROOT, "enclave-live.ts"));
+  const { writeFileSync: wf9 } = await import("node:fs");
+
+  const dir = mkdtempSync(join(tmpdir(), "enclave-funnel-"));
+  wf9(
+    join(dir, "models.json"),
+    JSON.stringify({
+      providers: {
+        opendesign: {
+          models: [
+            {
+              id: "deepseek-v4.1-flash",
+              reasoning: true,
+              input: ["text", "image"],
+              contextWindow: 1048000,
+              maxTokens: 232000,
+              thinkingLevelMap: { off: "none", minimal: "minimal", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" },
+            },
+          ],
+        },
+      },
+    }),
+  );
+
+  // A model as the live path builds it: gateway-declared window, vanilla output.
+  const built = {
+    id: "cyberouter/deepseek-v4.1-flash",
+    name: "DeepSeek V4.1 Flash",
+    provider: "EnClave",
+    reasoning: true,
+    input: ["text"],
+    contextWindow: 1048576,
+    maxTokens: 16384,
+    cost: { input: 0.3, output: 1.2, cacheRead: 0, cacheWrite: 0 },
+    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
+    compat: { supportsDeveloperRole: false },
+    provenance: { contextWindow: "gateway", maxTokens: "vanilla", thinkingLevelMap: "vanilla", input: "gateway", cost: "gateway" },
+  };
+  const donorIdx = buildDonorIndex(readDonorConfig(dir));
+
+  const viaFinalize = finalize(built, { donor: donorIdx });
+  check("funnel: donor max-out reaches the published model", viaFinalize.maxTokens === 232000, String(viaFinalize.maxTokens));
+  check("funnel: donor images reach the published model", JSON.stringify(viaFinalize.input) === '["text","image"]', JSON.stringify(viaFinalize.input));
+
+  // The snapshot carries the same provenance shape, so the static catalog must
+  // agree with the live path field for field.
+  const snapDir = mkdtempSync(join(tmpdir(), "enclave-snapcmp-"));
+  wf9(
+    join(snapDir, "models.json"),
+    JSON.stringify({
+      providers: { opendesign: JSON.parse(fsRead(join(dir, "models.json"))).providers.opendesign },
+      EnClave: { models: [{ ...built }] },
+    }),
+  );
+  const snap = buildStaticCatalog(snapDir);
+  const snapEntry = snap.find((m) => m.id === "cyberouter/deepseek-v4.1-flash");
+  check("funnel: the offline static catalog matches the live values", snapEntry && snapEntry.maxTokens === 232000, String(snapEntry && snapEntry.maxTokens));
+  check("funnel: the offline static catalog matches the live images", snapEntry && JSON.stringify(snapEntry.input) === '["text","image"]', String(snapEntry && JSON.stringify(snapEntry.input)));
+  check("funnel: cost identical on both paths", snapEntry && snapEntry.cost.input === 0.3, String(snapEntry && snapEntry.cost.input));
+
+  // A retired id must not appear in the static catalog either.
+  wf9(join(snapDir, "enclave-retired.json"), JSON.stringify({ updatedAt: Date.now(), retired: { "cyberouter/deepseek-v4.1-flash": { at: Date.now(), reason: "upstream-gone" } } }));
+  const snap2 = buildStaticCatalog(snapDir);
+  check("funnel: the static catalog honours the ledger", !snap2.some((m) => m.id === "cyberouter/deepseek-v4.1-flash"));
+
+  rmSync(dir, { recursive: true, force: true });
+  rmSync(snapDir, { recursive: true, force: true });
 }
 
 // ---------------------------------------------------------------- cleanup

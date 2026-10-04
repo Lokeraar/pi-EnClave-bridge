@@ -179,7 +179,7 @@ const NOISE_PATTERN =
 // ---------------------------------------------------------------------------
 
 /**
- * A snapshot of the catalog observed on 2026-10-03 (14 models, 13 routable + 5 aliases), so `findInitialModel()` can
+ * A snapshot of the catalog observed on 2026-10-03 (14 models, 2 retired, + 5 aliases), so `findInitialModel()` can
  * resolve during startup before any network call happens. Every value here is
  * `curated` — it is a transcription of one observation, not a live fact. The
  * live layer overwrites it as soon as a fetch succeeds.
@@ -195,6 +195,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 1.4, output: 4.4, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "glm-5", creator: "Zhipu (open weight; hosted US/EU only)", endpointCount: 3, routeableEndpointCount: 3 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/glm-5.3-flash",
@@ -206,6 +213,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 0.15, output: 0.5, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "glm-5", creator: "Zhipu (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 2 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/glm-5.2",
@@ -217,6 +231,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 1.4, output: 4.4, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "glm-5", creator: "Zhipu (open weight; hosted US/EU only)", endpointCount: 3, routeableEndpointCount: 3 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/deepseek-v4-pro",
@@ -228,6 +249,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 1.32, output: 3.96, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "deepseek-v4", creator: "DeepSeek (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 2 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/deepseek-v4.1-flash",
@@ -239,6 +267,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 0.3, output: 1.2, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "deepseek-v4.1", creator: "DeepSeek (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 2 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/deepseek-v4-flash",
@@ -250,6 +285,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 0.13, output: 0.26, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "deepseek-v4", creator: "DeepSeek (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 2 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/qwen3.8-max",
@@ -261,6 +303,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 2, output: 6, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "qwen3.8", creator: "Alibaba (open weight; hosted US/EU only)", endpointCount: 1, routeableEndpointCount: 1 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/kimi-k3",
@@ -272,17 +321,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "kimi-k3", creator: "Moonshot (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 2 },
-  },
-  {
-    id: "cyberouter/kimi-k2.6",
-    name: "Kimi K2.6",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 262144,
-    maxTokens: 16384,
-    cost: { input: 0.95, output: 4, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "kimi-k2", creator: "Moonshot (open weight; hosted US/EU only)", endpointCount: 2, routeableEndpointCount: 1 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/gpt-oss-120b",
@@ -294,6 +339,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 0.1, output: 0.5, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "gpt-oss", creator: "OpenAI (open weight)", endpointCount: 2, routeableEndpointCount: 2 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/minimax-m3",
@@ -305,17 +357,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 0.3, output: 1.2, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "minimax-m3", creator: "MiniMax (open weight; hosted US/EU only)", endpointCount: 1, routeableEndpointCount: 1 },
-  },
-  {
-    id: "cyberouter/inkling",
-    name: "Inkling",
-    reasoning: true,
-    input: ["text"],
-    contextWindow: 262144,
-    maxTokens: 16384,
-    cost: { input: 1, output: 4.05, cacheRead: 0, cacheWrite: 0 },
-    thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
-    metadata: { family: "inkling", creator: "Thinking Machines", endpointCount: 2, routeableEndpointCount: 2 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/nemotron-ultra",
@@ -327,6 +375,13 @@ export const SNAPSHOT_MODELS: LiveModelConfig[] = [
     cost: { input: 0.6, output: 2.4, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     metadata: { family: "nemotron", creator: "NVIDIA", endpointCount: 2, routeableEndpointCount: 1 },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "gateway",
+      cost: "gateway",
+    },
   },
 ];
 
@@ -342,6 +397,13 @@ export const SNAPSHOT_ALIAS_MODELS: LiveModelConfig[] = [
     cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     alias: { task: null, sort: "task_perf" },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "vanilla",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/vuln-discovery",
@@ -353,6 +415,13 @@ export const SNAPSHOT_ALIAS_MODELS: LiveModelConfig[] = [
     cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     alias: { task: "vuln_discovery", sort: "task_perf" },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "vanilla",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/exploit-dev",
@@ -364,6 +433,13 @@ export const SNAPSHOT_ALIAS_MODELS: LiveModelConfig[] = [
     cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     alias: { task: "exploit_dev", sort: "task_perf" },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "vanilla",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/remediation",
@@ -375,6 +451,13 @@ export const SNAPSHOT_ALIAS_MODELS: LiveModelConfig[] = [
     cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     alias: { task: "remediation", sort: "task_perf" },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "vanilla",
+      cost: "gateway",
+    },
   },
   {
     id: "cyberouter/triage",
@@ -386,6 +469,13 @@ export const SNAPSHOT_ALIAS_MODELS: LiveModelConfig[] = [
     cost: { input: 2.7, output: 13.5, cacheRead: 0, cacheWrite: 0 },
     thinkingLevelMap: { off: null, minimal: null, low: null, medium: "medium", high: null, xhigh: null, max: null },
     alias: { task: "triage", sort: "task_perf" },
+    provenance: {
+      contextWindow: "gateway",
+      maxTokens: "vanilla",
+      thinkingLevelMap: "vanilla",
+      input: "vanilla",
+      cost: "gateway",
+    },
   },
 ];
 
@@ -1470,6 +1560,59 @@ export async function runReprobeAudit(options: {
 // refreshModels
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// The single build funnel
+// ---------------------------------------------------------------------------
+
+/**
+ * Every published model goes through here, on every path — live refresh, offline
+ * restore, and the statically registered snapshot alike.
+ *
+ * This exists because the layers were being applied per-path by hand, and each
+ * omission was a silent correctness bug: the offline baked snapshot skipped the
+ * retirement ledger, then skipped the donor, while the live path did both. Three
+ * of these had already shipped. Funnelling means a new layer is applied once,
+ * here, and cannot be forgotten on one branch.
+ */
+export interface FinalizeContext {
+  donor?: DonorIndex;
+  retired?: ReadonlySet<string>;
+}
+
+export function finalize(m: LiveModelConfig, ctx: FinalizeContext = {}): LiveModelConfig {
+  const base = normalize(m);
+  return ctx.donor ? applyDonor(base, ctx.donor).model : base;
+}
+
+/**
+ * The list-level counterpart: normalize + donor on each entry, then drop the
+ * retired ones. Retirement is a list operation — a single model cannot remove
+ * itself — so it lives here and nowhere else.
+ */
+export function finalizeAll(models: readonly LiveModelConfig[], ctx: FinalizeContext = {}): LiveModelConfig[] {
+  const retired = ctx.retired ?? new Set<string>();
+  const out: LiveModelConfig[] = [];
+  for (const m of models) {
+    if (retired.has(m.id)) continue;
+    out.push(finalize(m, ctx));
+  }
+  return out;
+}
+
+/**
+ * The static catalog for registration, built through the same funnel so the
+ * eagerly registered list is byte-identical to what a refresh would publish.
+ * Without this, `pi --list-models` — which never touches the network — showed
+ * the raw snapshot: vanilla max-out and no images, while the live path showed
+ * inherited values for the same models.
+ */
+export function buildStaticCatalog(agentDir: string): LiveModelConfig[] {
+  return finalizeAll([...SNAPSHOT_MODELS, ...SNAPSHOT_ALIAS_MODELS], {
+    donor: buildDonorIndex(readDonorConfig(agentDir)),
+    retired: retiredIds(agentDir),
+  });
+}
+
 export interface RefreshModelsOptions {
   agentDir: string;
   fallbackBaseUrl?: string;
@@ -1527,6 +1670,7 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
     // `buildDonorIndex` yields an empty index and every fill is skipped.
     const donor = buildDonorIndex(readDonorConfig(options.agentDir));
     const authority = donor.config.authority;
+    const retired = retiredIds(options.agentDir);
     const baseUrl = options.baseUrlOverride ?? fallbackBaseUrl;
     const storedModels = (ctx.stored?.models ?? []).filter(
       (m) => m && typeof m.id === "string" && (!m.provider || m.provider === PROVIDER_ID),
@@ -1540,25 +1684,25 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
         // fallback is returned to Pi directly and is what the no-network path
         // publishes, so an unfiltered copy here resurrects whatever was retired
         // after the snapshot was taken.
-        const retiredNow = retiredIds(options.agentDir);
-        const baked = [...SNAPSHOT_MODELS, ...SNAPSHOT_ALIAS_MODELS]
-          .filter((m) => !retiredNow.has(m.id))
-          .map((m) => normalize(m));
+        const baked = finalizeAll([...SNAPSHOT_MODELS, ...SNAPSHOT_ALIAS_MODELS], {
+          donor,
+          retired: retiredIds(options.agentDir),
+        });
         return baked.length ? baked : undefined;
       }
       // Ids a previous SUCCESSFUL live check found retired must not come back,
       // neither from the store nor from the curated file.
-      const retired = retiredIds(options.agentDir);
       const alive = (m: LiveModelConfig) => !retired.has(m.id);
       const liveStored = storedModels.filter(alive);
       const liveCurated = curated.filter(alive);
       const ids: string[] = [];
       for (const m of [...liveStored, ...liveCurated]) if (!ids.includes(m.id)) ids.push(m.id);
-      const merged = ids.map((id) => {
-        const storedEntry = liveStored.find((m) => m.id === id);
-        const base = normalize(curatedById.get(id) ?? (storedEntry as LiveModelConfig));
-        return curatedById.has(id) && !authority ? base : applyDonor(base, donor).model;
-      });
+      const merged = ids.map((id) =>
+        finalize(curatedById.get(id) ?? (liveStored.find((m) => m.id === id) as LiveModelConfig), {
+          donor,
+          retired,
+        }),
+      );
       if (ctx.signal.aborted) return undefined;
       if (!sameModels(merged, storedModels)) {
         const ok = await ctx.publish({
@@ -1579,7 +1723,6 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
     // This fetch SUCCEEDED, so it is authoritative about membership AND about
     // which listed ids actually have a healthy route for this key.
     reconcileRetired(options.agentDir, catalog, [...storedModels, ...curated]);
-    const retired = retiredIds(options.agentDir);
 
     const storedById = new Map(storedModels.map((m) => [m.id, m]));
     const bounds = catalogBounds(catalog.models);
@@ -1605,14 +1748,14 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
       if (known) {
         // Curated normally outranks everything, but in donor AUTHORITY mode the
         // donor is the source of truth and is applied last, to curated too.
-        out.push(authority ? applyDonor(known, donor).model : known);
+        out.push(finalize(known, { donor, retired }));
         continue;
       }
       const previous = storedById.get(listing.id);
       if (previous) {
-        // Already built in a past session; the donor only fills evidence-free
-        // fields that a previous session could not resolve either.
-        out.push(applyDonor(normalize(previous), donor).model);
+        // Already built in a past session; the funnel fills evidence-free fields
+        // that a previous session could not resolve either.
+        out.push(finalize(previous, { donor, retired }));
         continue;
       }
       // Brand-new id: probe only what the gateway does not declare.
@@ -1626,18 +1769,18 @@ export function makeRefreshModels(options: RefreshModelsOptions) {
       if (ctx.signal.aborted) return undefined;
       // A successful probe wins over the donor: it is a measurement ON this
       // gateway. `applyDonor` only fills what the probe left as `vanilla`.
-      out.push(applyDonor(probed ?? gatewayModel(listing), donor).model);
+      out.push(finalize(probed ?? gatewayModel(listing), { donor, retired }));
     }
 
     for (const alias of catalog.aliases) {
       if (ctx.signal.aborted) return undefined;
       const known = curatedById.get(alias.id);
       if (known) {
-        out.push(authority ? applyDonor(known, donor).model : known);
+        out.push(finalize(known, { donor, retired }));
         continue;
       }
       const previous = storedById.get(alias.id);
-      out.push(previous ? applyDonor(normalize(previous), donor).model : aliasModel(alias, bounds));
+      out.push(finalize(previous ?? aliasModel(alias, bounds), { donor, retired }));
     }
 
     const persisted = await ctx.publish({ persist: { models: out, checkedAt: Date.now() } });
