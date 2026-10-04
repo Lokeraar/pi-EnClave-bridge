@@ -18,16 +18,23 @@
  *      for providers that are ACTIVE (a credential exists in `auth.json`),
  *      because an inactive provider's models are not reachable anyway.
  *
- * Together they complement each other, and when two bundled catalogs disagree
- * the value is averaged. They are independent companies describing the same
- * third-party model, so a disagreement is two opinions and not a fact — and the
- * midpoint is the spot both have some claim to.
+ * They are consulted in a strict order, and the first one that knows the model
+ * supplies its values:
  *
- * A bundled value AGREES with a hand value when it is within `ROUNDING_TOLERANCE`
- * (the hand value was rounded by a person, so `128_000` and `131_072` are the
- * same number written differently). It is then allowed to replace it, because
- * it is the exact figure. Outside that band they genuinely differ, and the hand
- * value wins.
+ *     hand-written  >  openrouter  >  every other active provider
+ *
+ * OpenRouter ranks second because it is the largest model router and its
+ * catalog is its core business, maintained for years. The rest are NOT
+ * competing sources: they corroborate. A provider lower in the order only fills
+ * a field the ones above it left empty, and is otherwise reported as agreement.
+ * Nothing is ever averaged — a number nobody published is not a consensus, it
+ * is an invention.
+ *
+ * A hand value AGREES with a lower-priority one when it is within
+ * `ROUNDING_TOLERANCE` (the hand value was rounded by a person, so `128_000`
+ * and `131_072` are the same number written differently). The exact figure then
+ * wins, because it is the same number with more precision. Outside that band
+ * they genuinely differ, and the hand value stands.
  *
  * Two things are never copied from any donor, because they describe the
  * endpoint rather than the model:
@@ -59,8 +66,11 @@ export interface ModelEntry {
   contextWindow?: number;
   maxTokens?: number;
   compat?: Record<string, unknown>;
-  /** Set by the sync script: which donors contributed, and how. */
-  donor?: { sources: string[]; rule: "hand" | "exact" | "midpoint" };
+  /**
+   * Set by the sync script. `source` supplied the values; `corroborating`
+   * lists the other providers that also know the model and agree it exists.
+   */
+  donor?: { source: string; corroborating: string[]; rule: "hand" | "exact" | "corroborated" | "none" };
   [key: string]: unknown;
 }
 
@@ -72,9 +82,6 @@ export const DONOR_FIELDS = [
   "maxTokens",
   "compat",
 ] as const;
-
-/** The two numeric fields that get averaged between bundled catalogs. */
-const AVERAGED_FIELDS = ["maxTokens"] as const;
 
 /**
  * How close a hand-written value must be to a bundled one to count as the same
@@ -178,27 +185,46 @@ export function readActiveBundledCatalogs(
     const catalog = readBundledCatalog(dir, provider);
     if (catalog && catalog.models.size) out.push(catalog);
   }
-  return out;
+  // Strict order: the first provider that knows a model supplies its values.
+  // The hand-written layer is passed separately and always outranks these.
+  const rank = (p: string) => {
+    const i = PROVIDER_PRIORITY.indexOf(p as (typeof PROVIDER_PRIORITY)[number]);
+    return i === -1 ? PROVIDER_PRIORITY.length : i;
+  };
+  return out.sort((a, b) => rank(a.provider) - rank(b.provider) || a.provider.localeCompare(b.provider));
 }
 
 // ---------------------------------------------------------------------------
 // Resolving one model
 // ---------------------------------------------------------------------------
 
+/**
+ * Which provider's catalog outranks which. Anything not listed falls after
+ * these, in the order they appear in auth.json.
+ */
+export const PROVIDER_PRIORITY = ["opendesign", "openrouter"] as const;
+
 export interface Resolved {
   entry: ModelEntry;
-  sources: string[];
-  rule: "hand" | "exact" | "midpoint" | "none";
+  /** The source that supplied the values, if any. */
+  source?: string;
+  /** Every other provider that also knows this model: corroboration only. */
+  corroborating: string[];
+  rule: "hand" | "exact" | "corroborated" | "none";
 }
 
 const withinTolerance = (a: number, b: number) =>
   Math.abs(a - b) <= ROUNDING_TOLERANCE * Math.max(Math.abs(a), Math.abs(b));
 
 /**
- * Resolve one model's values from the hand layer and the bundled catalogs.
+ * Resolve one model's values, in strict priority order:
  *
- * `hand` is `providers.opendesign` (or whatever provider the user wrote by
- * hand). `bundled` is every active bundled catalog that has this bare name.
+ *     hand-written  >  openrouter  >  the rest of the active providers
+ *
+ * The first source that knows the model supplies its values. Every other source
+ * that knows it is recorded as corroboration — it confirms the model exists and
+ * agrees on its structure, but it never overrides a higher source. Nothing is
+ * averaged.
  */
 export function resolveModel(
   bare: string,
@@ -208,65 +234,49 @@ export function resolveModel(
 ): Resolved {
   // Aliases are left alone: the same bare name is a different thing in a
   // different router, and its catalog numbers would be false here.
-  if (isAlias) {
-    return { entry: {}, sources: [], rule: "none" };
-  }
+  if (isAlias) return { entry: {}, corroborating: [], rule: "none" };
 
-  const hits = bundled
+  const knowing = bundled
     .map((c) => ({ provider: c.provider, entry: c.models.get(bare) }))
     .filter((h): h is { provider: string; entry: ModelEntry } => !!h.entry);
 
-  // 1. No bundled source: the hand layer, or nothing.
-  if (!hits.length) {
-    if (!hand) return { entry: {}, sources: [], rule: "none" };
-    return { entry: copyFields(hand), sources: ["hand"], rule: "hand" };
-  }
-
-  const sources = hits.map((h) => h.provider);
-
-  // 2. Bundled sources disagree: average the numeric fields, and prefer an
-  // exact hand figure for the rest when there is one.
-  let base: ModelEntry;
-  let rule: Resolved["rule"] = "exact";
-  if (hits.length === 1) {
-    base = { ...hits[0].entry };
-  } else {
-    rule = "midpoint";
-    base = { ...hits[0].entry };
-    for (const field of AVERAGED_FIELDS) {
-      const values = hits.map((h) => num(h.entry[field])).filter((v): v is number => v !== undefined);
-      if (values.length) (base as Record<string, unknown>)[field] = Math.round(values.reduce((a, b) => a + b, 0) / values.length);
-    }
-  }
-
-  const out = copyFields(base);
-
-  // 3. The hand layer outranks a bundled value unless the two agree to within
-  // rounding — a person writing 128_000 for 131_072 is the same number, so the
-  // exact figure is an improvement, not a contradiction.
+  // 1. The hand layer, when it has the model. It is the top authority; lower
+  //    sources only get to correct it within the rounding band, where they are
+  //    the same number with more precision.
   if (hand) {
-    for (const field of DONOR_FIELDS) {
-      const handValue = hand[field];
-      if (handValue === undefined) continue;
-      const bundledValue = out[field];
-      if (bundledValue === undefined) {
-        (out as Record<string, unknown>)[field] = handValue;
-        continue;
-      }
-      if (typeof handValue === "number" && typeof bundledValue === "number") {
-        if (withinTolerance(handValue, bundledValue)) {
-          (out as Record<string, unknown>)[field] = bundledValue; // exact wins over rounded
-        } else {
-          (out as Record<string, unknown>)[field] = handValue; // genuine disagreement
+    const entry = copyFields(hand);
+    const corroborating = knowing.map((h) => h.provider);
+    for (const { provider, entry: b } of knowing) {
+      for (const field of DONOR_FIELDS) {
+        const bundledValue = b[field];
+        if (bundledValue === undefined) continue;
+        const handValue = entry[field];
+        if (handValue === undefined) {
+          (entry as Record<string, unknown>)[field] = bundledValue; // gap the hand layer left open
+          continue;
         }
-        continue;
+        if (typeof handValue === "number" && typeof bundledValue === "number" && withinTolerance(handValue, bundledValue)) {
+          (entry as Record<string, unknown>)[field] = bundledValue; // same number, exact wins
+        }
+        // Otherwise the values genuinely differ and the hand value stands.
       }
-      (out as Record<string, unknown>)[field] = handValue;
+      void provider;
     }
-    if (!sources.includes("hand")) sources.push("hand");
+    return { entry, source: "hand", corroborating, rule: corroborating.length ? "corroborated" : "hand" };
   }
 
-  return { entry: out, sources, rule: rule === "exact" && hand ? "exact" : rule };
+  // 2. No hand entry: the highest-priority bundled catalog that knows it.
+  if (knowing.length) {
+    const [first, ...rest] = knowing;
+    return {
+      entry: copyFields(first.entry),
+      source: first.provider,
+      corroborating: rest.map((h) => h.provider),
+      rule: "exact",
+    };
+  }
+
+  return { entry: {}, corroborating: [], rule: "none" };
 }
 
 function copyFields(from: ModelEntry): ModelEntry {
@@ -276,3 +286,11 @@ function copyFields(from: ModelEntry): ModelEntry {
   }
   return out;
 }
+
+/**
+ * Pi's extension loader treats EVERY `extensions/*.ts` file as an extension
+ * factory and reports "does not export a valid factory function" otherwise.
+ * This file is a helper imported by `index.ts`, so it needs a no-op default
+ * export to load silently beside it.
+ */
+export default async function donorsHelper(): Promise<void> {}

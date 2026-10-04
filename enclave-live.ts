@@ -229,7 +229,7 @@ export function buildBlock(
     const isAlias = isAliasId(listing.id, catalog.aliases);
     const r = resolveModel(bare, hand.get(bare), bundled, isAlias);
     resolved.set(listing.id, r);
-    if (!r.sources.length) pending.push(listing.id);
+    if (!r.source) pending.push(listing.id);
 
     const entry: ModelEntry = {
       ...r.entry,
@@ -277,7 +277,9 @@ export function buildBlock(
         cacheWrite: 0,
       },
       api: "openai-completions",
-      donor: r.sources.length ? { sources: r.sources, rule: r.rule === "none" ? "hand" : r.rule } : undefined,
+      donor: r.source
+        ? { source: r.source, corroborating: r.corroborating, rule: r.rule === "none" ? "hand" : r.rule }
+        : undefined,
     };
     models.push(entry);
   }

@@ -137,12 +137,29 @@ Models whose id ends in `free` are skipped: they routinely ship with capabilitie
 cut down, so their numbers describe a reduced product. In OpenRouter the suffix
 is `:free`, in OpenCode `-free`; both end in `free`.
 
-### When bundled catalogs disagree
+### Strict order, and what "confirmation" means
 
-They are averaged. Two independent companies describing the same third-party
-model is two opinions, not a fact, and the midpoint is the spot both have some
-claim to. Where the gap is small it does not matter; where it is large it does,
-which is why the clamp below exists.
+The bundled catalogs are consulted in a fixed order, and **the first one that
+knows a model supplies its values**:
+
+```
+escrito a mano  >  openrouter  >  el resto de los proveedores activos
+```
+
+Everything below the winner is **corroboration**: it confirms the model exists
+and agrees on its structure, and it only fills a field the sources above left
+empty. It never overrides. `sync-models.mjs` prints who confirmed what, so
+agreement between catalogs is visible rather than assumed.
+
+**Nothing is ever averaged.** A number nobody published is not a consensus, it
+is an invention — and averaging a correct catalog against a wrong one produces
+a value neither of them stands behind. Where two catalogs disagree, the
+higher-priority one is right by definition of the order, and the lower one is
+recorded as dissent rather than blended in.
+
+The practical difference from averaging: `minimax-m3` is 512,000 (openrouter's
+figure, and EnClave accepts it) where the midpoint of 512,000 and 128,000 would
+have been 320,000 — a number derived from nothing anyone measured.
 
 ### What no donor may set
 

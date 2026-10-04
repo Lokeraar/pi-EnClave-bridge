@@ -108,7 +108,7 @@ const bundled = catalogDir ? readActiveBundledCatalogs(agentDir, { exclude: [PRO
 const result = buildBlock(catalog, hand, bundled, baseUrl, (id) => !dead.has(id));
 
 const short = (id) => id.replace(/^cyberouter\//, "");
-const byRule = (rule) => [...result.resolved.entries()].filter(([, r]) => r.rule === rule && r.sources.length);
+const byRule = (rule) => [...result.resolved.entries()].filter(([, r]) => r.rule === rule && r.source);
 
 const report = [
   `EnClave — ${baseUrl}`,
@@ -119,18 +119,28 @@ const report = [
   `  bundled          ${bundled.length} proveedores activos con catálogo: ${bundled.map((c) => c.provider).join(", ") || "ninguno"}`,
   `  catálogo de Pi   ${catalogDir ?? "NO ENCONTRADO"}`,
   ``,
-  `Resueltos desde un donante: ${[...result.resolved.values()].filter((r) => r.sources.length).length}`,
+  `Resueltos desde un donante: ${[...result.resolved.values()].filter((r) => r.source).length}`,
+  ``,
+  `Orden de autoridad: escrito a mano > openrouter > el resto de los activos`,
 ];
 
 const grouped = [
+  ["a mano (autoridad máxima), con confirmación de otro proveedor", byRule("corroborated")],
   ["a mano (autoridad máxima)", byRule("hand")],
-  ["coincide con el bundled (redondeo)", byRule("exact")],
-  ["promedio entre bundled", byRule("midpoint")],
+  ["providers activos (sin valor a mano)", byRule("exact")],
 ];
 for (const [label, rows] of grouped) {
   if (!rows.length) continue;
   report.push(`\n  ${label}: ${rows.length}`);
-  for (const [id, r] of rows) report.push(`    ${short(id).padEnd(24)} ${r.sources.join(" + ")}`);
+  for (const [id, r] of rows) {
+    const corr = r.corroborating.length ? `   confirmado por: ${r.corroborating.join(", ")}` : "";
+    report.push(`    ${short(id).padEnd(24)} ${r.source ?? "-"}${corr}`);
+  }
+}
+
+const corroboratedOnly = [...result.resolved.values()].filter((r) => r.source !== "hand" && r.corroborating.length);
+if (corroboratedOnly.length) {
+  report.push(`\n  además confirmados por un segundo proveedor: ${corroboratedOnly.length}`);
 }
 
 // Aliases are handled in their own loop, so they are reported separately rather

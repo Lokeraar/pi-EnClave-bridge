@@ -47,7 +47,7 @@ console.log("\nhand-written is the top authority");
 {
   const r = resolveModel("glm-5.2", { maxTokens: 262144, input: ["text"] }, [cat("openrouter", { "glm-5.2": { maxTokens: 131072, input: ["text"] } })], false);
   check("a large disagreement keeps the hand value", r.entry.maxTokens === 262144, String(r.entry.maxTokens));
-  check("and records that a hand value was used", r.sources.includes("hand"), r.sources.join(","));
+  check("and records that a hand value was used", r.source === "hand", String(r.source));
 }
 
 console.log("\nrounding is not a disagreement");
@@ -60,12 +60,23 @@ console.log("\nrounding is not a disagreement");
   check("the band is 5%", Math.abs(ROUNDING_TOLERANCE - 0.05) < 1e-9, String(ROUNDING_TOLERANCE));
 }
 
-console.log("\ntwo bundled catalogs that disagree are averaged");
+console.log("\nstrict order: nothing is averaged");
 {
   const r = resolveModel("minimax-m3", undefined, [cat("openrouter", { "minimax-m3": { maxTokens: 512000 } }), cat("opencode", { "minimax-m3": { maxTokens: 128000 } })], false);
-  check("the midpoint is used", r.entry.maxTokens === 320000, String(r.entry.maxTokens));
-  check("the rule is reported as midpoint", r.rule === "midpoint", r.rule);
-  check("both sources are named", r.sources.join(",") === "openrouter,opencode", r.sources.join(","));
+  check("the highest-priority catalog supplies the value", r.entry.maxTokens === 512000, String(r.entry.maxTokens));
+  check("NOT an average of the two", r.entry.maxTokens !== 320000, String(r.entry.maxTokens));
+  check("the lower one is recorded as corroboration", r.corroborating.join(",") === "opencode", r.corroborating.join(","));
+  check("the source is named", r.source === "openrouter", String(r.source));
+
+  // A hand value outranks both bundled ones and is only refined within the band.
+  const h = resolveModel("minimax-m3", { maxTokens: 400000 }, [cat("openrouter", { "minimax-m3": { maxTokens: 512000 } }), cat("opencode", { "minimax-m3": { maxTokens: 128000 } })], false);
+  check("a hand value outranks both", h.entry.maxTokens === 400000, String(h.entry.maxTokens));
+  check("both lower providers corroborate", h.corroborating.join(",") === "openrouter,opencode", h.corroborating.join(","));
+
+  // A hand value inside the rounding band of a bundled one takes the exact figure.
+  const band = resolveModel("glm-5.3-flash", { maxTokens: 128000 }, [cat("openrouter", { "glm-5.3-flash": { maxTokens: 131072 } })], false);
+  check("within the band the exact figure wins", band.entry.maxTokens === 131072, String(band.entry.maxTokens));
+  check("within the band it is still the hand source", band.source === "hand", String(band.source));
 }
 
 console.log("\nfree models are excluded, active providers only");
@@ -94,7 +105,7 @@ console.log("\naliases are never resolved from a donor");
 {
   const r = resolveModel("auto", { maxTokens: 999 }, [cat("openrouter", { auto: { maxTokens: 30000, contextWindow: 2000000 } })], true);
   check("an alias yields no donor values", Object.keys(r.entry).length === 0, JSON.stringify(r.entry));
-  check("an alias is reported as untouched", r.rule === "none" && r.sources.length === 0, r.rule);
+  check("an alias is reported as untouched", r.rule === "none" && r.source === undefined && r.corroborating.length === 0, r.rule);
 }
 
 console.log("\nthe block: matching, near misses, endpoint-owned fields");
@@ -120,8 +131,8 @@ console.log("\nthe block: matching, near misses, endpoint-owned fields");
 
   // It has a hand value, so it HAS a donor record — what matters is that the
   // bundled catalog for `glm-5.3-flash` did not bleed into it.
-  check("the near miss does not take the bundled figure", by["cyberouter/glm-5.3"].donor?.sources.join(",") !== "openrouter", JSON.stringify(by["cyberouter/glm-5.3"]?.donor));
-  check("the near miss is attributed to the hand layer", by["cyberouter/glm-5.3"].donor?.sources.join(",") === "hand", JSON.stringify(by["cyberouter/glm-5.3"]?.donor));
+  check("the near miss does not take the bundled figure", by["cyberouter/glm-5.3"].donor?.source !== "openrouter", JSON.stringify(by["cyberouter/glm-5.3"]?.donor));
+  check("the near miss is attributed to the hand layer", by["cyberouter/glm-5.3"].donor?.source === "hand", JSON.stringify(by["cyberouter/glm-5.3"]?.donor));
   check("the near miss keeps its own hand value", by["cyberouter/glm-5.3"].maxTokens === 999999, String(by["cyberouter/glm-5.3"].maxTokens));
   check("the exact match takes the bundled figure", by["cyberouter/glm-5.3-flash"].maxTokens === 131072, String(by["cyberouter/glm-5.3-flash"].maxTokens));
   check("the endpoint owns the context window", by["cyberouter/glm-5.3-flash"].contextWindow === 1048576, String(by["cyberouter/glm-5.3-flash"].contextWindow));
