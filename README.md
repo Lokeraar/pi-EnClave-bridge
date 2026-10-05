@@ -1,5 +1,8 @@
 # @lokeraar/pi-enclave-bridge
 
+[![Version: 0.1.1](https://img.shields.io/badge/version-0.1.1-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 EnClave provider for [Pi](https://pi.dev). The live router catalog shows up in
 `/model` with **real context windows, real per-token prices, live membership and
 the router's task aliases** — resolved from the model catalog Pi already ships,
@@ -8,6 +11,36 @@ with no extra account required.
 <a href="https://github.com/Gentleman-Programming/gentle-ai">
   <img width="220" src="https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/docs/assets/brand/built-with-gentle-ai.png" alt="Built with Gentle-AI" />
 </a>
+
+## 📋 Releases
+
+### 0.1.1 — a clamp that left room for an actual prompt
+
+The ceiling clamp kept back 2,048 tokens for the prompt. That router counts
+`messages + tools + max_tokens` against the window, not the output alone, and a
+real Pi call carries the system prompt plus every tool schema — order 20k
+tokens. The reserve only covered a toy request.
+
+`gpt-oss-120b` exposed it: a 131,072 window with a 117,964 ceiling left 13,108
+tokens for input, below what Pi sends, so **every** call failed with `400` as
+soon as the conversation carried anything. Measured with the same prompt:
+
+```
+input ~16k   ceiling 117964   HTTP 400   "needs about 133,972 tokens"
+input ~16k   ceiling  98304   HTTP 200
+input ~28k   ceiling  98304   HTTP 200
+```
+
+The published value is a ceiling, not a fixed request: Pi reduces it per turn to
+`min(published, contextWindow − prompt − reserve)`. The reserve just had to be
+realistic.
+
+### 0.1.0 — first release
+
+Values resolved from the model catalog Pi ships, with the vendor's model card
+outranking every catalog. `/login` once and the live router catalog appears in
+`/model` with real context windows, real per-token prices, live membership and
+the router's task aliases.
 
 ## ⚡ Quick Start
 
