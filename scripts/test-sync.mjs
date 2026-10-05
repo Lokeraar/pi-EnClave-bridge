@@ -20,7 +20,7 @@ import { join } from "node:path";
 const ROOT = join(new URL(".", import.meta.url).pathname, "..");
 const { bareName, resolveModel, readBundledCatalog, readPiCatalogs, findBundledCatalogDir, findBundledCatalogs, ROUNDING_TOLERANCE } =
   await import(join(ROOT, "donors.ts"));
-const { buildBlock } = await import(join(ROOT, "enclave-live.ts"));
+const { buildBlock, PROMPT_RESERVE_TOKENS } = await import(join(ROOT, "enclave-live.ts"));
 
 let passed = 0;
 const failed = [];
@@ -214,7 +214,8 @@ console.log("\nthe block: matching, near misses, endpoint-owned fields");
   check("alias price is the catalog ceiling", by["cyberouter/auto"].cost.input === 1.4, String(by["cyberouter/auto"].cost.input));
   check("aliases carry no donor record", by["cyberouter/auto"].donor === undefined);
 
-  check("an impossible ceiling is clamped below the window", by["cyberouter/inkling"].maxTokens === 262144 - 2048, String(by["cyberouter/inkling"].maxTokens));
+  check("an impossible ceiling is clamped below the window", by["cyberouter/inkling"].maxTokens === 262144 - PROMPT_RESERVE_TOKENS, String(by["cyberouter/inkling"].maxTokens));
+  check("the clamp leaves room for a real prompt", PROMPT_RESERVE_TOKENS >= 32_768, String(PROMPT_RESERVE_TOKENS));
   check("maxTokens is never null (Pi crashes formatting it)", out.models.every((m) => typeof m.maxTokens === "number"), "hay un null");
 }
 

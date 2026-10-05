@@ -181,8 +181,14 @@ const num = (v: unknown, fallback: number) => (typeof v === "number" && v > 0 ? 
 /**
  * Tokens held back from an output ceiling so the prompt has room. See the clamp
  * in buildBlock.
+ *
+ * This must cover a real Pi request, not a toy one. The router counts
+ * `messages + tools + max_tokens` against the window, so a reserve smaller than
+ * the system prompt plus every tool schema makes the model unusable in practice:
+ * gpt-oss-120b (131,072 window) shipped a 117,964 ceiling that left ~13k for
+ * input, below what Pi sends, and every call 400'd once the conversation grew.
  */
-const PROMPT_RESERVE_TOKENS = 2_048;
+export const PROMPT_RESERVE_TOKENS = 32_768;
 
 /** Aliases the router exposes: never resolved from a donor. See donors.ts. */
 function isAliasId(id: string, aliases: readonly CatalogAlias[]): boolean {
