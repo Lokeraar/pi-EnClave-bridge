@@ -19,7 +19,7 @@ import { join } from "node:path";
 
 const ROOT = join(new URL(".", import.meta.url).pathname, "..");
 const { bareName, resolveModel, readBundledCatalog, readPiCatalogs, findBundledCatalogDir, findBundledCatalogs, ROUNDING_TOLERANCE } =
-  await import(join(ROOT, "donors.ts"));
+  await import(join(ROOT, "donors-enclave.ts"));
 const { buildBlock, PROMPT_RESERVE_TOKENS } = await import(join(ROOT, "enclave-live.ts"));
 
 let passed = 0;
@@ -44,7 +44,7 @@ check("strips only the last segment", bareName("a/b/c") === "c");
 
 console.log("\nthe vendor's model card outranks every catalog");
 {
-  const { VENDOR_SPEC } = await import(join(ROOT, "donors.ts"));
+  const { VENDOR_SPEC } = await import(join(ROOT, "donors-enclave.ts"));
   check("glm-5.3 has a card", !!VENDOR_SPEC["glm-5.3"]);
   check("glm-5.2 has a card", !!VENDOR_SPEC["glm-5.2"]);
   check("each card records why it exists", Object.values(VENDOR_SPEC).every((v) => v.why.length > 40));
@@ -158,7 +158,7 @@ console.log("\nthe catalog is found without a stored path");
 
   // The Pi install is found by an absolute prefix and would shadow the store, so
   // the preference order is exercised on the store scanner directly.
-  const { storeCatalogs } = await import(join(ROOT, "donors.ts"));
+  const { storeCatalogs } = await import(join(ROOT, "donors-enclave.ts"));
   const dirs = storeCatalogs(fake);
   check("store catalogs are found without a stored path", dirs.length >= 1, String(dirs.length));
   check("the newest version wins whatever the folder is called", dirs[0].includes("0.99.0"), dirs[0]);

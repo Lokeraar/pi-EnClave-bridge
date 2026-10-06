@@ -37,17 +37,17 @@ import {
   type Resolved,
   bareName,
   resolveModel,
-} from "./donors.ts";
+} from "./donors-enclave.ts";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 export type ThinkingLevelMap = Partial<Record<ThinkingLevel, string | null>>;
 
-export type { ModelEntry } from "./donors.ts";
+export type { ModelEntry } from "./donors-enclave.ts";
 
 export const ENCLAVE_BASE_URL = "https://router.enclave.ai/v1";
 export const PROVIDER_ID = "EnClave";
 
-export { bareName } from "./donors.ts";
+export { bareName } from "./donors-enclave.ts";
 
 // ---------------------------------------------------------------------------
 // models.json

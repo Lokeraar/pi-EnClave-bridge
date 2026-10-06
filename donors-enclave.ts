@@ -675,4 +675,4 @@ function copyFields(from: ModelEntry, fields: readonly string[]): ModelEntry {
  * This file is a helper imported by `index.ts`, so it needs a no-op default
  * export to load silently beside it.
  */
-export default async function donorsHelper(): Promise<void> {}
+export default async function enclaveDonorsHelper(): Promise<void> {}
