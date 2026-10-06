@@ -12,6 +12,25 @@ with no extra account required.
   <img width="220" src="https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/docs/assets/brand/built-with-gentle-ai.png" alt="Built with Gentle-AI" />
 </a>
 
+## 🔗 Where to find me
+
+| | |
+|---|---|
+| 📦 **npm** | [`@lokeraar/pi-enclave-bridge`](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge) |
+| 🌐 **Pi catalog** | [pi.dev/packages/@lokeraar/pi-enclave-bridge](https://pi.dev/packages/@lokeraar/pi-enclave-bridge) |
+| ⭐ **Source** | [github.com/Lokeraar/pi-EnClave-bridge](https://github.com/Lokeraar/pi-EnClave-bridge) |
+
+Install it in Pi:
+
+```bash
+pi install npm:@lokeraar/pi-enclave-bridge
+```
+
+> 💛 If this bridge ever saved you from guessing a model's limits, a ⭐ on the
+> repo goes a long way. It is the only thing that helps somebody else find it,
+> and it tells me which of these two bridges is worth polishing next. Every star
+> is read by a human, and so is every bug report.
+
 ## 📋 Releases
 
 ### 0.1.1 — a clamp that left room for an actual prompt
