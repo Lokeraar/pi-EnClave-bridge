@@ -1,6 +1,6 @@
 {
   "name": "@lokeraar/pi-enclave-bridge",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "EnClave provider bridge for Pi: /login once and the live router catalog appears in /model with real context windows, real per-token prices, live membership and the router's task aliases \u2014 resolved from the model catalog Pi already ships.",
   "type": "module",
   "main": "./index.ts",
