@@ -153,6 +153,44 @@ They are deliberately **never** resolved from a catalog. OpenRouter has a model
 called `auto` too, advertising a 2,000,000 window — a different thing that shares
 the name, and a lie here.
 
+## 🐞 Fixes
+
+**A ceiling that the window cannot hold is impossible, not large.** OpenRouter
+listed `inkling` at 471,859 against a 262,144 window here, and the endpoint
+refused it with *"This request needs about N tokens (messages + tools +
+max_tokens)"*. Clamped to the window minus a prompt reserve.
+
+**The reserve has to survive a real conversation.** 2,048 tokens covered a toy
+request. This router counts `messages + tools + max_tokens` against the window,
+not the output alone, and a real Pi call carries the system prompt plus every
+tool schema — order 20k tokens. `gpt-oss-120b` had 13,108 tokens of input room
+and **every** call returned `400` as soon as the conversation carried anything.
+
+**`maxTokens` must never be `null`.** Pi's model list calls `.toString()` on it
+and crashes with *"Cannot read properties of undefined"*, taking the whole list
+with it.
+
+**`compat` is never inherited from a catalog.** OpenRouter ships
+`thinkingFormat: "openrouter"` plus seven other flags describing how *it* wants
+reasoning framed. This endpoint speaks the OpenAI shape — verified by sending
+`reasoning_effort` and watching what came back. Copying those flags would change
+the request format on an endpoint they were never tested against.
+
+**An accepted value is not an implemented one.** The endpoint accepts all six
+effort levels for `glm-5.3`; the vendor card says the model only implements
+low, high and max. The extras are accepted and then ignored, which is worse than
+not offering them: Pi would show a thinking level that silently does nothing.
+
+**A catalog that omits a key has not claimed anything.** An explicit `null` is a
+claim and is applied; an absent key is silence and does not erase a known value.
+Thinking maps are merged key by key, so a one-key catalog entry cannot delete a
+seven-key one.
+
+**A scoped package publishes private by default.** `npm publish` failed with
+`E402 "You must sign up for private packages"`, which reads like a billing
+problem and is not one: restricted packages need a paid plan. Declared in the
+manifest as `"publishConfig": { "access": "public" }`.
+
 ## 🔑 Authentication
 
 ```
