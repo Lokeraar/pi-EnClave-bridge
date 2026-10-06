@@ -164,7 +164,10 @@ console.log("\nthe catalog is found without a stored path");
   check("the newest version wins whatever the folder is called", dirs[0].includes("0.99.0"), dirs[0]);
   const cat2 = readBundledCatalog(dirs[0], "openrouter");
   check("the newest catalog is the one read", cat2.models.get("glm-5.3").maxTokens === 999, String(cat2.models.get("glm-5.3").maxTokens));
-  check("a + prerelease is never preferred", !dirs.some((d) => d.includes("0.90.0+dev")), dirs.join(","));
+  // The prerelease is still listed, but never first: only the first entry is
+  // ever used, and sorting it last keeps a fallback visible without letting it win.
+  check("a + prerelease is never the first choice", !dirs[0].includes("0.90.0+dev"), dirs[0]);
+  check("and it sorts last", dirs[dirs.length - 1].includes("0.90.0+dev"), dirs.join(","));
 
   const locs = findBundledCatalogs(fake);
   check("the Pi install is preferred over the store", locs[0].origin === "la que usa Pi", locs[0].origin);
