@@ -1,6 +1,6 @@
 # @lokeraar/pi-enclave-bridge
 
-[![Version: 0.1.1](https://img.shields.io/badge/version-0.1.1-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
+[![Version: 0.1.2](https://img.shields.io/badge/version-0.1.2-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 EnClave provider for [Pi](https://pi.dev). The live router catalog shows up in
@@ -31,6 +31,11 @@ pi install npm:@lokeraar/pi-enclave-bridge
 > Every star is read by a human, and so is every bug report.
 
 ## 📋 Releases
+
+### 0.1.2 — documentation
+
+Links in both directions, so the npm page and the source repo point at each
+other, and a note asking for a star. No behaviour change.
 
 ### 0.1.1 — a clamp that left room for an actual prompt
 
