@@ -293,12 +293,23 @@ function buildBlockUnsafe(
       ),
       // The endpoint owns these two.
       contextWindow: num(listing.contextLength, 128_000),
-      cost: {
-        input: listing.pricingPrompt ?? 0,
-        output: listing.pricingCompletion ?? 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-      },
+      // An alias carries no price of its own — which concrete model the router
+      // picks decides it, per request — so when the catalog does not state one
+      // it is bounded at the ceiling, the same rule the alias loop below
+      // applies. Publishing it as free would be a claim nobody made.
+      cost: isAlias && listing.pricingPrompt == null && listing.pricingCompletion == null
+        ? {
+            input: pricesIn.length ? Math.max(...pricesIn) : 0,
+            output: pricesOut.length ? Math.max(...pricesOut) : 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+          }
+        : {
+            input: listing.pricingPrompt ?? 0,
+            output: listing.pricingCompletion ?? 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+          },
       api: "openai-completions",
       donor: r.source
         ? {
@@ -316,7 +327,13 @@ function buildBlockUnsafe(
   // which concrete model the router picks per request, so both are bounded
   // rather than guessed — context at the catalog floor, price at the ceiling.
   // Left vanilla on purpose: the same bare name is a different thing elsewhere.
+  //
+  // The catalog ALSO lists these ids under `data`, where the loop above
+  // already published them with the endpoint's own window and name. Publishing
+  // an id twice means two entries with different values for the same model, so
+  // only the aliases `data` does not carry reach this fallback.
   for (const alias of catalog.aliases) {
+    if (models.some((m) => m.id === alias.id)) continue;
     if (!alive(alias.id)) {
       skipped.push({ id: alias.id, why: "no responde" });
       continue;
