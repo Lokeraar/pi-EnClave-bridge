@@ -230,6 +230,39 @@ console.log("\nthe block: matching, near misses, endpoint-owned fields");
   check("maxTokens is never null (Pi crashes formatting it)", out.models.every((m) => typeof m.maxTokens === "number"), "hay un null");
 }
 
+console.log("\nan alias listed under data is published once, not twice");
+{
+  // The live catalog returns the five cyberouter/* task aliases in BOTH `data`
+  // and `aliases`. Before the dedup this produced two entries per alias with
+  // different windows, names and prices.
+  const catalog = {
+    models: [
+      { id: "cyberouter/auto", name: "Auto (Enclave Router)", contextLength: 131072, routeable: true },
+      { id: "cyberouter/glm-5.3", name: "GLM 5.3", contextLength: 1048576, pricingPrompt: 1.4, pricingCompletion: 4.4, routeable: true },
+    ],
+    aliases: [{ id: "cyberouter/auto", task: null }],
+  };
+  const out = buildBlock(catalog, new Map(), [], "https://x", () => true);
+  const autos = out.models.filter((m) => m.id === "cyberouter/auto");
+  check("the alias is published exactly once", autos.length === 1, String(autos.length));
+  check("it keeps the endpoint's own window", autos[0]?.contextWindow === 131072, String(autos[0]?.contextWindow));
+  check("it keeps the endpoint's own name", autos[0]?.name === "Auto (Enclave Router)", String(autos[0]?.name));
+  // The catalog states no price for an alias: which concrete model the router
+  // picks decides it, so it is bounded at the ceiling rather than shown as free.
+  check("a priceless alias is bounded at the ceiling, not free", autos[0]?.cost.input === 1.4 && autos[0]?.cost.output === 4.4, JSON.stringify(autos[0]?.cost));
+  check("every published id is unique", new Set(out.models.map((m) => m.id)).size === out.models.length, out.models.map((m) => m.id).join(","));
+
+  // An alias that `data` does NOT carry still takes the floor/ceiling fallback.
+  const onlyAlias = buildBlock(
+    { models: [{ id: "cyberouter/glm-5.3", name: "GLM 5.3", contextLength: 1048576, pricingPrompt: 1.4, pricingCompletion: 4.4, routeable: true }],
+      aliases: [{ id: "cyberouter/triage", task: null }] },
+    new Map(), [], "https://x", () => true,
+  );
+  const tri = onlyAlias.models.find((m) => m.id === "cyberouter/triage");
+  check("an alias absent from data still gets the floor", tri?.contextWindow === 1048576, String(tri?.contextWindow));
+  check("and the ceiling", tri?.cost.input === 1.4 && tri?.cost.output === 4.4, JSON.stringify(tri?.cost));
+}
+
 console.log("\nthe scripts resolve their own location on any OS");
 {
   // new URL(...).pathname yields "/C:/...%20..." on Windows, which Node rejects
