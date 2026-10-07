@@ -33,9 +33,19 @@
 import { copyFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const HERE = new URL(".", import.meta.url).pathname;
+// `.pathname` on a file: URL is NOT a usable path on Windows: it keeps a
+// leading slash and percent-encodes the spaces ("/C:/Users/My%20Name/..."), so
+// Node reads it as a package name and dies with ERR_INVALID_MODULE_SPECIFIER
+// before the script does anything. fileURLToPath is the portable form.
+const HERE = fileURLToPath(new URL(".", import.meta.url));
 const ROOT = join(HERE, "..");
+
+// On Windows a dynamic import refuses a bare absolute path ("C:\\..." —
+// ERR_UNSUPPORTED_ESM_URL_SCHEME) the same way it refuses the percent-encoded
+// one, so a helper converts to a file: URL once. Both scripts need it.
+const load = (file) => import(pathToFileURL(join(ROOT, file)).href);
 const {
   ENCLAVE_BASE_URL,
   PROVIDER_ID,
@@ -46,8 +56,8 @@ const {
   providerModels,
   readModelsJson,
   writeModelsJson,
-} = await import(join(ROOT, "enclave-live.ts"));
-const { findBundledCatalogDir, readPiCatalogs } = await import(join(ROOT, "donors.ts"));
+} = await load("enclave-live.ts");
+const { findBundledCatalogDir, readPiCatalogs } = await load("donors-enclave.ts");
 
 const argv = process.argv.slice(2);
 const flag = (n) => argv.includes(n);
