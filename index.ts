@@ -23,6 +23,13 @@
  */
 
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+
+/**
+ * Kept in step with package.json, because a user running loose files in
+ * ~/.pi/agent/extensions has no other way to tell which build they are on — and
+ * a bug report without that is a report we cannot act on.
+ */
+export const BRIDGE_VERSION = "0.1.7";
 import {
   ENCLAVE_BASE_URL,
   makeRefreshModels,
@@ -37,7 +44,7 @@ export default async function (pi: ExtensionAPI) {
   const baseUrl = (cfg.baseUrl as string) ?? ENCLAVE_BASE_URL;
 
   pi.registerProvider(PROVIDER_ID, {
-    name: (cfg.name as string) ?? "EnClave",
+    name: `${(cfg.name as string) ?? "EnClave"} ${BRIDGE_VERSION}`,
     api: (cfg.api as string) ?? "openai-completions",
     baseUrl,
     authHeader: cfg.authHeader !== false,
