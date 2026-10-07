@@ -16,11 +16,19 @@
  */
 
 import { join } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
-const ROOT = join(new URL(".", import.meta.url).pathname, "..");
+// `.pathname` is not a usable path on Windows (leading slash, spaces
+// percent-encoded); fileURLToPath is. Without it this file cannot even be
+// imported on Windows, so `npm test` runs nowhere but Linux.
+const ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..");
+
+// A dynamic import rejects a bare absolute Windows path just as it rejects the
+// percent-encoded one, so it goes through a file: URL.
+const load = (file) => import(pathToFileURL(join(ROOT, file)).href);
 const { bareName, resolveModel, readBundledCatalog, readPiCatalogs, findBundledCatalogDir, findBundledCatalogs, ROUNDING_TOLERANCE } =
-  await import(join(ROOT, "donors-enclave.ts"));
-const { buildBlock, PROMPT_RESERVE_TOKENS } = await import(join(ROOT, "enclave-live.ts"));
+  await load("donors-enclave.ts");
+const { buildBlock, PROMPT_RESERVE_TOKENS } = await load("enclave-live.ts");
 
 let passed = 0;
 const failed = [];
@@ -44,7 +52,7 @@ check("strips only the last segment", bareName("a/b/c") === "c");
 
 console.log("\nthe vendor's model card outranks every catalog");
 {
-  const { VENDOR_SPEC } = await import(join(ROOT, "donors-enclave.ts"));
+  const { VENDOR_SPEC } = await load("donors-enclave.ts");
   check("glm-5.3 has a card", !!VENDOR_SPEC["glm-5.3"]);
   check("glm-5.2 has a card", !!VENDOR_SPEC["glm-5.2"]);
   check("each card records why it exists", Object.values(VENDOR_SPEC).every((v) => v.why.length > 40));
@@ -158,7 +166,7 @@ console.log("\nthe catalog is found without a stored path");
 
   // The Pi install is found by an absolute prefix and would shadow the store, so
   // the preference order is exercised on the store scanner directly.
-  const { storeCatalogs } = await import(join(ROOT, "donors-enclave.ts"));
+  const { storeCatalogs } = await load("donors-enclave.ts");
   const dirs = storeCatalogs(fake);
   check("store catalogs are found without a stored path", dirs.length >= 1, String(dirs.length));
   const fixtureDir = dirs.filter((d) => d.includes("enclave-upd-"));
@@ -220,6 +228,14 @@ console.log("\nthe block: matching, near misses, endpoint-owned fields");
   check("an impossible ceiling is clamped below the window", by["cyberouter/inkling"].maxTokens === 262144 - PROMPT_RESERVE_TOKENS, String(by["cyberouter/inkling"].maxTokens));
   check("the clamp leaves room for a real prompt", PROMPT_RESERVE_TOKENS >= 32_768, String(PROMPT_RESERVE_TOKENS));
   check("maxTokens is never null (Pi crashes formatting it)", out.models.every((m) => typeof m.maxTokens === "number"), "hay un null");
+}
+
+console.log("\nthe scripts resolve their own location on any OS");
+{
+  // new URL(...).pathname yields "/C:/...%20..." on Windows, which Node rejects
+  // as a package specifier; both scripts must use fileURLToPath instead.
+  const { existsSync } = await import("node:fs");
+  check("this file resolves the package root", existsSync(join(ROOT, "donors-enclave.ts")), ROOT);
 }
 
 console.log("\nexisting values are kept when there is no donor at all");
