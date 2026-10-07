@@ -210,6 +210,23 @@ export function buildBlock(
   baseUrl: string,
   alive: (id: string) => boolean = () => true,
 ): BuildResult {
+  try {
+    return buildBlockUnsafe(catalog, kept, bundled, baseUrl, alive);
+  } catch {
+    // Pi refreshes every provider in one batch, so an exception here aborts the
+    // whole batch and leaves every provider on cached models. A donor that cannot
+    // be applied must degrade to "no donors", never to a failed login.
+    return { models: [], resolved: new Map(), pending: [], skipped: [] };
+  }
+}
+
+function buildBlockUnsafe(
+  catalog: LiveCatalog,
+  kept: Map<string, ModelEntry>,
+  bundled: readonly BundledCatalog[],
+  baseUrl: string,
+  alive: (id: string) => boolean = () => true,
+): BuildResult {
   const models: ModelEntry[] = [];
   const resolved = new Map<string, Resolved>();
   const pending: string[] = [];

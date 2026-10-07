@@ -1,6 +1,6 @@
 # @lokeraar/pi-enclave-bridge
 
-[![Version: 0.1.5](https://img.shields.io/badge/version-0.1.5-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
+[![Version: 0.1.6](https://img.shields.io/badge/version-0.1.6-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 EnClave provider for [Pi](https://pi.dev). The live router catalog shows up in
