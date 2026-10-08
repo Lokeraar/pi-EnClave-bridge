@@ -36,6 +36,7 @@ import {
   type ModelEntry,
   type Resolved,
   bareName,
+  readPiCatalogs,
   resolveModel,
 } from "./donors-enclave.ts";
 
@@ -389,13 +390,24 @@ export function makeRefreshModels(agentDir: string, baseUrl = ENCLAVE_BASE_URL) 
     const catalog = await fetchCatalog(baseUrl, key, ctx.signal);
     if (!catalog || ctx.signal.aborted) return undefined;
 
-    const live = new Set<string>([...catalog.models.filter((m) => m.routeable).map((m) => m.id), ...catalog.aliases.map((a) => a.id)]);
-    const configured = providerModels(readModelsJson(agentDir), PROVIDER_ID);
+    // Membership AND values. Resolving here rather than only in the maintenance
+    // script is what makes a fresh install work: a user who installs, logs in and
+    // opens /model must see contextWindow, maxTokens, input, reasoning, the
+    // thinking map and the price, without being told to run a script first.
+    // Resolved inline, a catalog Pi cannot see is a wrong one; a missing catalog
+    // just falls back to whatever models.json already holds.
+    let bundled: BundledCatalog[] = [];
+    try {
+      bundled = readPiCatalogs(agentDir, { exclude: [PROVIDER_ID] });
+    } catch {
+      bundled = [];
+    }
 
-    // Known values for anything the endpoint still serves. A new id has no
-    // values here; `scripts/sync-models.mjs` is what fills it in.
-    const out = configured.filter((m) => live.has(m.id));
-    for (const id of live) if (!out.some((m) => m.id === id)) out.push({ id, name: id });
+    const configured = new Map(
+      providerModels(readModelsJson(agentDir), PROVIDER_ID).map((m) => [bareName(m.id), m]),
+    );
+    const block = buildBlock(catalog, configured, bundled, baseUrl);
+    const out = block.models;
 
     if (ctx.signal.aborted) return undefined;
     const ok = await ctx.publish({ persist: { models: out, checkedAt: Date.now() } });

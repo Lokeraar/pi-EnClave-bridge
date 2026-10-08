@@ -22,6 +22,9 @@
  * collides and registers the provider twice.
  */
 
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
@@ -29,7 +32,29 @@ import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent"
  * ~/.pi/agent/extensions has no other way to tell which build they are on — and
  * a bug report without that is a report we cannot act on.
  */
-export const BRIDGE_VERSION = "0.1.7";
+export const BRIDGE_VERSION = readPackageVersion() ?? "0.0.0-unknown";
+
+/**
+ * The version comes from package.json, which is the only place it is written.
+ *
+ * It used to be a constant next to this line, and it drifted: 0.1.8 shipped
+ * with the manifest saying 0.1.8 and this file still saying 0.1.7, so /logout
+ * and /model showed a version that was not the one installed. Two sources of
+ * truth always drift; there is now one.
+ *
+ * Returns undefined for a loose copy dropped into `~/.pi/agent/extensions`,
+ * where there is no manifest beside it — which is exactly when the diagnose
+ * script has something to tell you.
+ */
+function readPackageVersion(): string | undefined {
+  try {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const manifest = JSON.parse(readFileSync(join(here, "package.json"), "utf8")) as { version?: string };
+    return typeof manifest.version === "string" ? manifest.version : undefined;
+  } catch {
+    return undefined;
+  }
+}
 import {
   ENCLAVE_BASE_URL,
   makeRefreshModels,
