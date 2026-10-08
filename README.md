@@ -1,6 +1,6 @@
 # @lokeraar/pi-enclave-bridge
 
-[![Version: 0.1.6](https://img.shields.io/badge/version-0.1.6-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
+[![Version: 0.1.8](https://img.shields.io/badge/version-0.1.8-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 EnClave provider for [Pi](https://pi.dev). The live router catalog shows up in
@@ -31,6 +31,69 @@ pi install npm:@lokeraar/pi-enclave-bridge
 > Every star is read by a human, and so is every bug report.
 
 ## 📋 Releases
+
+### 0.1.8 — the maintenance script runs anywhere, and each alias is published once
+
+`scripts/sync-models.mjs` is the only writer of `providers.EnClave.models`, and it
+could not run at all in two independent ways. The result was a picker with ids and
+names only: no context window, no ceiling, no price, no reasoning levels, because
+the values were never written.
+
+**Windows could not even start it.** `new URL(".", import.meta.url).pathname`
+returns `/C:/Users/My%20Name/...` — a leading slash and percent-encoded spaces —
+which Node rejects as a package name:
+
+```
+ERR_INVALID_MODULE_SPECIFIER: Invalid module "\C:\Users\My%20Name\...\donors-enclave.ts"
+is not a valid package name
+```
+
+Fixing that is not enough on its own: a dynamic `import()` also refuses a bare
+absolute Windows path (`C:\...`) with `ERR_UNSUPPORTED_ESM_URL_SCHEME`. Both are
+now `fileURLToPath` / `pathToFileURL`, and `scripts/test-sync.mjs` carried the
+same bug, so `npm test` ran nowhere but Linux.
+
+**On every platform it imported a name that no longer existed.** The donor module
+became `donors-enclave.ts` in 0.1.4, when the two bridges stopped overwriting each
+other. `enclave-live.ts`, `package.json` and `test-sync.mjs` were updated;
+`sync-models.mjs` was missed, so the script has failed with
+`Cannot find module .../donors.ts` since that release.
+
+**Each router alias was published twice.** The live catalog returns the five
+`cyberouter/*` task aliases in **both** `data` and the sibling `aliases` array,
+and both loops published them — the same id twice, with different windows, names
+and prices. The alias fallback now only covers ids `data` does not carry, so the
+entry keeps the endpoint's own window and name.
+
+The price needed the other half of the same idea: an alias states no price (which
+model the router picks decides it, per request), so the `data` entry published it
+as `0` — free. The alias rule was already "price at the ceiling" for exactly that
+reason, and now applies however the alias was reached. A value nobody published is
+not a price of zero, it is an unstated one.
+
+The suite is 67 offline checks and now runs on Windows. Seven of them are new and
+pin the alias behaviour: one entry per alias, the endpoint's own window and name
+kept, the ceiling applied when the price is absent, every published id unique, and
+an alias absent from `data` still taking the fallback.
+
+### 0.1.7 — a version you can read, and a bug report you can fill
+
+Three gaps that made an incoming report unusable.
+
+**No version.** A user running loose files in `~/.pi/agent/extensions` had no way
+to tell which build they were on, and the diagnose script read the repository's
+`package.json`, which does not exist next to an npm install. The version is now
+exported, printed on load, and shown in the provider name in `/model`.
+
+**No form.** `.github/ISSUE_TEMPLATE/bug-report.yml` asks for the one thing that
+locates a cause: the diagnose output, which lists every directory searched for
+the catalogs. Plus OS, Node version, Pi version, install method, and the provider
+block with the key hidden.
+
+**The diagnose was not in the package.** The form pointed at
+`scripts/diagnose.mjs`, which existed on disk but was never committed, so the
+command in the form would have failed on every version before this one. It ships
+now, and runs with plain `node`, no flags, no repository.
 
 ### 0.1.6 — a broken catalog tree no longer takes the provider down
 
@@ -227,10 +290,15 @@ model was one of the dead ones.
 `cyberouter/auto` plus one per security task (`vuln-discovery`, `exploit-dev`,
 `remediation`, `triage`) are usable as a model and are published.
 
-They live in a sibling field of the catalog, not inside `data`, so a parser that
-only reads `data` silently loses all five. Their window and price depend on which
-concrete model the router picks per request, so both are bounded rather than
-guessed: context at the catalog floor, price at the catalog ceiling.
+The endpoint lists them twice: once inside `data` and once in a sibling field of
+the catalog. Both are read, and each alias is published **once** — from the `data`
+entry, which carries the endpoint's own window and name. A parser that reads only
+one of the two either loses all five (sibling only) or publishes each of them
+twice with different values (`data` only).
+
+Their price depends on which concrete model the router picks per request, so it is
+bounded rather than guessed: at the catalog ceiling. When the endpoint states no
+window either, the context falls back to the catalog floor.
 
 They are deliberately **never** resolved from a catalog. OpenRouter has a model
 called `auto` too, advertising a 2,000,000 window — a different thing that shares
@@ -384,7 +452,7 @@ node --experimental-strip-types scripts/sync-models.mjs
 It reports which donor supplied each value, who corroborated it, what is still
 missing, and what it excluded. Then it writes `models.json` and leaves a backup.
 
-To add a vendor correction, add it to `VENDOR_SPEC` in `donors.ts` with the reason
+To add a vendor correction, add it to `VENDOR_SPEC` in `donors-enclave.ts` with the reason
 it exists, so a later reader can check it against the model card.
 
 ### Tests
@@ -393,9 +461,10 @@ it exists, so a later reader can check it against the model card.
 node --experimental-strip-types scripts/test-sync.mjs
 ```
 
-58 offline checks: bare-name matching and the near miss that must not match, the
+67 offline checks: bare-name matching and the near miss that must not match, the
 model-card precedence, the strict donor order, nothing-averaged, free-model
-exclusion, dated slugs, alias exclusion, the ceiling clamp, and a simulated Pi
+exclusion, dated slugs, alias exclusion, one entry per router alias with the
+ceiling applied when no price is stated, the ceiling clamp, and a simulated Pi
 update that renames the catalog folder.
 
 ## License
