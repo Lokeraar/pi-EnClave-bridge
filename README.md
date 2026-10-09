@@ -274,26 +274,29 @@ Then log in once:
 The catalog builds itself. `/model` shows every model the router serves for your
 key, with the values resolved and each one attributed to where it came from.
 
-> **Do not load two copies of this bridge.** A loose file in
-> `~/.pi/agent/extensions/` and the installed package both register the same
-> provider; they can conflict and show stale values. If the package is already
-> installed from npm, update that same source in one command:
+> **First check how the older copy was installed.** Pi can load an extension as
+> an installed package, or directly from a `.ts` file in `~/.pi/agent/extensions/`.
+> If both copies are present, both can register EnClave and conflict. Updating a
+> package does not remove a loose file.
+>
+> `pi list` shows installed packages. If this package is already listed from npm,
+> update it in place:
 >
 > ```bash
 > pi update npm:@lokeraar/pi-enclave-bridge
 > ```
 >
-> If it was installed from git, update the same git source instead:
+> If `pi list` shows it was installed from git, update that same source instead:
 >
 > ```bash
 > pi update git:github.com/Lokeraar/pi-EnClave-bridge
 > ```
 >
-> Do not switch sources with `pi update`: Pi may keep the original package too.
-> If a loose `enclave-bridge.ts` is in `~/.pi/agent/extensions/`, remove it or
-> rename it outside `extensions/`, then restart Pi. `PI_ENCLAVE_LIVE=0` disables
-> refresh; it does not remove a duplicate registration. Use `pi list` to inspect
-> installed packages.
+> **Do not run both commands.** Use the one that matches the source already
+> installed; switching sources can leave two package entries. If you also have
+> an old loose EnClave file in `~/.pi/agent/extensions/`, remove it or move it
+> outside that folder, then restart Pi. `PI_ENCLAVE_LIVE=0` only turns off model
+> refresh; it does not remove a duplicate extension.
 
 ## Why this package exists
 
