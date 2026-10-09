@@ -849,32 +849,20 @@ export function resolveByCorroboration(
   primary?: string,
 ): FieldResolution | undefined {
   if (field === "thinkingLevelMap") {
-    const perKey = new Map<string, Map<string, { value: unknown; providers: string[] }>>();
-    for (const hit of hits) {
-      const map = hit.entry.thinkingLevelMap;
-      if (!map || typeof map !== "object") continue;
-      for (const [level, value] of Object.entries(map)) {
-        if (!perKey.has(level)) perKey.set(level, new Map());
-        const bucket = perKey.get(level)!;
-        const key = JSON.stringify(value);
-        if (!bucket.has(key)) bucket.set(key, { value, providers: [] });
-        bucket.get(key)!.providers.push(hit.provider);
-      }
-    }
-    if (!perKey.size) return undefined;
-    const out: Record<string, unknown> = {};
-    let total = 0;
-    for (const [level, bucket] of perKey) {
-      const r = pick(bucket, vendorProvider, primary);
-      total += r.total;
-      out[level] = r.winner.value;
-    }
-    return { value: out, votes: 0, total, how: "majority", providers: [] };
+    return resolveThinkingLevelMap(hits, primary);
   }
 
+
   const bucket = new Map<string, { value: unknown; providers: string[] }>();
+  const levelKey = field.startsWith("thinkingLevelMapKey:")
+    ? field.slice("thinkingLevelMapKey:".length)
+    : undefined;
   for (const hit of hits) {
-    const value = hit.entry[field];
+    const value = levelKey === undefined
+      ? hit.entry[field]
+      : hit.entry.thinkingLevelMap && Object.prototype.hasOwnProperty.call(hit.entry.thinkingLevelMap, levelKey)
+        ? hit.entry.thinkingLevelMap[levelKey]
+        : undefined;
     if (value === undefined) continue;
     let key: string;
     if (typeof value === "number") {
@@ -901,6 +889,45 @@ export function resolveByCorroboration(
     how: r.how,
     total: [...bucket.values()].reduce((s, b) => s + b.providers.length, 0),
     providers: r.winner.providers,
+  };
+}
+
+function resolveThinkingLevelMap(
+  hits: readonly CatalogHit[],
+  primary?: string,
+): FieldResolution | undefined {
+  const levels = new Set<string>();
+  for (const hit of hits) {
+    const map = hit.entry.thinkingLevelMap;
+    if (map && typeof map === "object") {
+      for (const level of Object.keys(map)) levels.add(level);
+    }
+  }
+  if (!levels.size) return undefined;
+
+  const value: Record<string, string | null> = {};
+  const winningProviders = new Set<string>();
+  let total = 0;
+  let allMajorities = true;
+
+  for (const level of levels) {
+    // Only catalogs with an explicit property vote. An omitted property is
+    // silence; null is an explicit vote that the level is unsupported.
+    const field = `thinkingLevelMapKey:${level}`;
+    const r = resolveByCorroboration(hits, field, undefined, primary);
+    if (!r) continue;
+    value[level] = r.value as string | null;
+    total += r.total;
+    for (const provider of r.providers) winningProviders.add(provider);
+    if (r.how !== "majority") allMajorities = false;
+  }
+
+  return {
+    value,
+    votes: winningProviders.size,
+    total,
+    how: allMajorities ? "majority" : "openrouter fallback",
+    providers: [...winningProviders],
   };
 }
 
@@ -1012,11 +1039,30 @@ export function resolveModel(
   const anyDonor = knowing[0];
 
   if (spec) {
-    const entry: ModelEntry = anyDonor ? copyFields(anyDonor.entry, BUNDLED_FIELDS) : {};
+    const entry: ModelEntry = anyDonor ? copyFields(anyDonor.entry, BUNDLED_FIELDS.filter((f) => f !== "thinkingLevelMap")) : {};
     if (spec.input) entry.input = spec.input;
     if (spec.maxTokens !== undefined) entry.maxTokens = spec.maxTokens;
-    if (spec.thinkingLevelMap) entry.thinkingLevelMap = spec.thinkingLevelMap as ThinkingLevelMap;
-    if (!anyDonor && kept) for (const f of HAND_FIELDS) if (kept[f] !== undefined) (entry as Record<string, unknown>)[f] = kept[f];
+
+    const levels = new Set<string>();
+    for (const hit of knowing) {
+      const map = hit.entry.thinkingLevelMap;
+      if (map && typeof map === "object") for (const level of Object.keys(map)) levels.add(level);
+    }
+    for (const level of Object.keys(spec.thinkingLevelMap ?? {})) levels.add(level);
+    if (levels.size) {
+      const map: Record<string, string | null> = {};
+      for (const level of levels) {
+        if (spec.thinkingLevelMap && Object.prototype.hasOwnProperty.call(spec.thinkingLevelMap, level)) {
+          map[level] = spec.thinkingLevelMap[level];
+          continue;
+        }
+        const resolved = resolveByCorroboration(knowing, `thinkingLevelMapKey:${level}`, undefined, primary);
+        if (resolved) map[level] = resolved.value as string | null;
+      }
+      if (Object.keys(map).length) entry.thinkingLevelMap = map as ThinkingLevelMap;
+    }
+
+    if (!anyDonor && kept) for (const f of HAND_FIELDS) if (f !== "thinkingLevelMap" && kept[f] !== undefined) (entry as Record<string, unknown>)[f] = kept[f];
     return {
       entry,
       source: "model card",
@@ -1048,14 +1094,34 @@ export function resolveModel(
     // loss dressed as authority.
     const entry: ModelEntry = {};
     for (const field of BUNDLED_FIELDS) {
+      if (field === "thinkingLevelMap") continue;
       if (official.entry[field] !== undefined && isPossibleValue(official.entry, field))
         (entry as Record<string, unknown>)[field] = official.entry[field];
     }
     const rest = knowing.filter((h) => h.provider !== official.provider);
     for (const field of BUNDLED_FIELDS) {
-      if (entry[field] !== undefined) continue;
+      if (field === "thinkingLevelMap" || entry[field] !== undefined) continue;
       const r = resolveByCorroboration(rest, field, undefined, primary);
       if (r) (entry as Record<string, unknown>)[field] = r.value;
+    }
+
+    const levels = new Set<string>();
+    for (const hit of [official, ...rest]) {
+      const map = hit.entry.thinkingLevelMap;
+      if (map && typeof map === "object") for (const level of Object.keys(map)) levels.add(level);
+    }
+    if (levels.size) {
+      const map: Record<string, string | null> = {};
+      for (const level of levels) {
+        const officialMap = official.entry.thinkingLevelMap;
+        if (officialMap && Object.prototype.hasOwnProperty.call(officialMap, level)) {
+          map[level] = officialMap[level];
+          continue;
+        }
+        const r = resolveByCorroboration(rest, `thinkingLevelMapKey:${level}`, undefined, primary);
+        if (r) map[level] = r.value as string | null;
+      }
+      if (Object.keys(map).length) entry.thinkingLevelMap = map as ThinkingLevelMap;
     }
     return {
       entry,

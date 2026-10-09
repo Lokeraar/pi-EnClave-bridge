@@ -47,6 +47,18 @@ pi install git:github.com/Lokeraar/pi-EnClave-bridge#v0.2.7
 
 ## 📋 Releases
 
+### 0.1.10 — vendor reasoning levels resolve key by key
+
+An official catalog can declare a partial `thinkingLevelMap`. That does not mean
+it owns levels it omitted. Each level now follows the same source rule as other
+fields: the vendor decides if it explicitly declares that level (including an
+explicit `null`); if it is silent, corroboration decides that key. A partial
+Anthropic map can therefore supply `max` without erasing `low` or `high` that
+other catalogs agree on. Added regression coverage for full official maps,
+partial official maps, and explicit vendor nulls.
+
+Tests: 107 passing, up from 100.
+
 ### 0.1.9 — the vendor's catalog decides, and agreement settles the rest
 
 The order that decides a model's values has changed, and it was worth getting
