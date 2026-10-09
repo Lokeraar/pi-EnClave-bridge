@@ -274,10 +274,26 @@ Then log in once:
 The catalog builds itself. `/model` shows every model the router serves for your
 key, with the values resolved and each one attributed to where it came from.
 
-> **Local copies conflict.** If you also keep `enclave-bridge.ts` in
-> `~/.pi/agent/extensions/`, remove it first. Two registrations of the same
-> provider fight over the model list. `PI_ENCLAVE_LIVE=0` does not fix this; only
-> removing one of them does.
+> **Do not load two copies of this bridge.** A loose file in
+> `~/.pi/agent/extensions/` and the installed package both register the same
+> provider; they can conflict and show stale values. If the package is already
+> installed from npm, update that same source in one command:
+>
+> ```bash
+> pi update npm:@lokeraar/pi-enclave-bridge
+> ```
+>
+> If it was installed from git, update the same git source instead:
+>
+> ```bash
+> pi update git:github.com/Lokeraar/pi-EnClave-bridge
+> ```
+>
+> Do not switch sources with `pi update`: Pi may keep the original package too.
+> If a loose `enclave-bridge.ts` is in `~/.pi/agent/extensions/`, remove it or
+> rename it outside `extensions/`, then restart Pi. `PI_ENCLAVE_LIVE=0` disables
+> refresh; it does not remove a duplicate registration. Use `pi list` to inspect
+> installed packages.
 
 ## Why this package exists
 
