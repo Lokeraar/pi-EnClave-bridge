@@ -1,6 +1,6 @@
 # @lokeraar/pi-enclave-bridge
 
-[![Version: 0.1.8](https://img.shields.io/badge/version-0.1.8-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
+[![Version: 0.1.10](https://img.shields.io/badge/version-0.1.10-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 EnClave provider for [Pi](https://pi.dev). The live router catalog shows up in
@@ -37,7 +37,7 @@ testing something specific, or a fix has not been published yet — during that
 window this is the only way to get it. To pin a release:
 
 ```bash
-pi install git:github.com/Lokeraar/pi-EnClave-bridge#v0.2.7
+pi install git:github.com/Lokeraar/pi-EnClave-bridge#v0.1.10
 ```
 
 
@@ -140,10 +140,10 @@ as `0` — free. The alias rule was already "price at the ceiling" for exactly t
 reason, and now applies however the alias was reached. A value nobody published is
 not a price of zero, it is an unstated one.
 
-The suite is 67 offline checks and now runs on Windows. Seven of them are new and
-pin the alias behaviour: one entry per alias, the endpoint's own window and name
-kept, the ceiling applied when the price is absent, every published id unique, and
-an alias absent from `data` still taking the fallback.
+At this release, the suite has 107 offline checks and runs on Windows. It covers
+one entry per router alias, the endpoint's own window and name, catalog matching
+by id and normalized name, vendor authority, key-by-key reasoning resolution,
+majority fallback, catalog discovery and the output ceiling clamp.
 
 ### 0.1.7 — a version you can read, and a bug report you can fill
 
@@ -185,18 +185,20 @@ the separator is a backslash, so the pick was arbitrary there.
 
 ### 0.1.5 — catalogs from a flat install too
 
-The catalogs can sit at three places depending on how Pi was installed, and only
-the two with a `dist` were being read:
+Catalogs can occupy several locations depending on how Pi was installed. The
+bridge first discovers the active Pi package at runtime, then checks supported
+agent-local store and flat-install layouts as fallbacks:
 
 ```
-<global>/…/pi-coding-agent/node_modules/@earendil-works/pi-ai/dist/providers/data
+<active Pi package>/node_modules/@earendil-works/pi-ai/dist/providers/data
 <agent>/npm/node_modules/.pnpm/@earendil-works+pi-ai@…/node_modules/…/pi-ai/dist/providers/data
 <agent>/npm/node_modules/@earendil-works/pi-ai/providers/data
 ```
 
-The third is what a flat install gives you: no `.pnpm`, and no `dist` either. The
-lookup found nothing on those machines, so every model fell back to its defaults
-— no context window, no ceiling, no reasoning levels.
+The first path is not hardcoded: Pi may be global, local, under a custom prefix,
+or installed by a different package manager. A flat install may have no `.pnpm`
+and no `dist`. If Pi upgrades its bundled `pi-ai`, restart Pi or refresh the
+provider so the bridge reads the updated catalogs.
 
 Two bugs fixed alongside it. The sibling roots were built from
 `dirname(agentDir)` as if that were the home directory, which for
@@ -293,30 +295,34 @@ This package resolves them, and never invents one.
 
 ## ⚙️ How it works
 
-Two layers, in strict order:
+The rules are applied per field, in this order:
 
+```text
+hand-written vendor card (VENDOR_SPEC)
+  > the catalog belonging to the model's official vendor
+  > simple majority among catalogs that state the field (only when there is no vendor catalog)
+  > OpenRouter fallback (when there is no vendor catalog or majority)
+  > values already kept in models.json, when no catalog states the field
 ```
-the vendor's own model card  >  openrouter  >  the other 41 catalogs Pi ships
-what is already in models.json is the fallback, used only when no catalog
-knows the model at all
-```
 
-**The vendor's card outranks everything.** A catalog records what a *reseller*
-believes a model accepts; the card records what the model *implements*. When they
-disagree the catalog is usually not lying — it is describing the gateway's shape.
-EnClave accepts all six effort values for `glm-5.3`; the card says the model only
-implements low, high and max. The extra values are accepted and then ignored,
-which is worse than not offering them: Pi would show a thinking level that
-silently does nothing.
+**The official vendor catalog is authoritative for the values it actually
+states.** A reseller's catalog describes what one gateway accepts; the vendor's
+catalog describes the model itself. The vendor is mapped by model family because
+resellers stamp their own provider name on models they resell. If there is no
+first-party catalog in Pi, the value most catalogs agree on wins. A simple
+majority is required; a plurality falls back to OpenRouter. Nothing is averaged.
 
-**OpenRouter leads the catalogs.** It is the largest model router in the world
-and the catalog is its core business. The other catalogs Pi ships (42 of them)
-confirm that a model exists and agree on its structure; they fill a field the ones
-above left empty and never override.
+**Thinking levels follow the same rule one key at a time.** An explicit vendor
+value — including `null` — decides that level. If the vendor omits a level, that
+is silence, and corroboration decides only that key. This lets a partial official
+map coexist with values other catalogs state, without allowing a reseller to
+replace levels the vendor did declare.
 
-**Nothing is averaged.** A number nobody published is not a consensus, it is an
-invention. Where two sources disagree, the higher-ranked one wins and the other
-is recorded as dissent.
+A ceiling equal to or above its catalog's own context window is treated as an
+impossible claim and falls through. `contextWindow` belongs to the endpoint and is never overwritten by a donor.
+`cost` is not published from a bundled catalog: prices belong to resellers, so
+combining them would make up a price EnClave may not charge. The donor module
+exposes a min/max cost range for inspection only.
 
 **No credential is needed to read a catalog.** The files live in Pi's own package
 (`pi-ai/dist/providers/data/`). A key is only needed to *call* an API, not to
@@ -401,10 +407,12 @@ effort levels for `glm-5.3`; the vendor card says the model only implements
 low, high and max. The extras are accepted and then ignored, which is worse than
 not offering them: Pi would show a thinking level that silently does nothing.
 
-**A catalog that omits a key has not claimed anything.** An explicit `null` is a
-claim and is applied; an absent key is silence and does not erase a known value.
-Thinking maps are merged key by key, so a one-key catalog entry cannot delete a
-seven-key one.
+**Catalog claims are resolved per field, and thinking maps per key.** An
+explicit vendor value — including `null` — is authoritative. If the vendor omits
+a thinking level, that omission is silence; only that level falls through to
+the other catalogs and their majority rule. A reseller's partial map cannot
+replace levels the vendor declared, and a partial vendor map can be completed
+from corroboration.
 
 **A scoped package publishes private by default.** `npm publish` failed with
 `E402 "You must sign up for private packages"`, which reads like a billing
@@ -495,16 +503,18 @@ npm test
 
 ### Where each value comes from
 
-The catalog Pi ships is at:
+Pi bundles one catalog per provider inside `pi-ai`:
 
-```
-<pi-ai>/dist/providers/data/<provider>.json
+```text
+<active Pi package>/node_modules/@earendil-works/pi-ai/dist/providers/data/<provider>.json
 ```
 
-42 of them, keyed by API and then by model id. The directory name carries the
-pi-ai version and a dependency hash, so it changes on every Pi update and any
-stored path dies with it — the lookup therefore walks the tree at run time, asking
-Node to resolve the copy Pi loads first and falling back to the agent's store.
+The bridge discovers Pi's active package at runtime; it does not hardcode a
+Termux, Windows, global-prefix or agent-specific path. It reads the catalogs in
+that active package whether or not the user has logged into those providers.
+Supported agent-local store and flat-install layouts are fallbacks. Updating Pi
+updates this source of model knowledge; restart Pi or refresh the provider to
+load the new catalogs.
 
 Models whose id ends in `free` are skipped: they routinely ship with capabilities
 cut down, so their numbers describe a reduced product.
@@ -577,11 +587,11 @@ it exists, so a later reader can check it against the model card.
 node --experimental-strip-types scripts/test-sync.mjs
 ```
 
-67 offline checks: bare-name matching and the near miss that must not match, the
-model-card precedence, the strict donor order, nothing-averaged, free-model
-exclusion, dated slugs, alias exclusion, one entry per router alias with the
-ceiling applied when no price is stated, the ceiling clamp, and a simulated Pi
-update that renames the catalog folder.
+107 offline checks: bare-id and normalized-name matching, dated near misses,
+model-card and vendor-family authority, per-key reasoning maps (including
+partial official maps and explicit nulls), majority fallback, alias exclusion,
+free-model exclusion, impossible ceiling rejection, router-alias handling, and
+simulated catalog layouts.
 
 ## License
 
