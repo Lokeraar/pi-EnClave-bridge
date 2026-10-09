@@ -87,7 +87,9 @@ console.log("\nopenrouter decides; what is written is only a fallback");
   const two = resolveModel("minimax-m3", undefined, [cat("openrouter", { "minimax-m3": { maxTokens: 512000 } }), cat("opencode", { "minimax-m3": { maxTokens: 128000 } })], false);
   check("the highest-priority catalog supplies the value", two.entry.maxTokens === 512000, String(two.entry.maxTokens));
   check("NOT the midpoint of the two", two.entry.maxTokens !== 320000, String(two.entry.maxTokens));
-  check("the lower one is recorded as corroboration", two.corroborating.join(",") === "opencode", two.corroborating.join(","));
+  // Every catalog that knows the model is a corroborator now, the primary
+  // included: it is one voice among several, not the one that decides alone.
+  check("both are recorded as corroboration", two.corroborating.includes("opencode"), two.corroborating.join(","));
 
   // Nothing in any catalog knows the model: what is written stands.
   const orphan = resolveModel("orphan", { maxTokens: 999, thinkingLevelMap: { low: "low" } }, [cat("openrouter", {})], false);
@@ -277,6 +279,132 @@ console.log("\nexisting values are kept when there is no donor at all");
   const hand = new Map([["orphan", { maxTokens: 999, thinkingLevelMap: { low: "low" } }]]);
   const out = buildBlock(catalog, hand, [], "https://x", () => true);
   check("the hand value survives", out.models[0].maxTokens === 999, String(out.models[0].maxTokens));
+}
+
+console.log("\nthe value most catalogs agree on is the one published");
+{
+  const { normaliseModelKey, resolveByCorroboration, estimateCostRange, VENDOR_CATALOG_ALIASES } = await load("donors-enclave.ts");
+
+  // deepseek.json spells the model `deepseek-flash` but names it "DeepSeek V4.1
+  // Flash". Stripping punctuation makes that the same key as the endpoint id,
+  // so the vendor's own catalog is reachable without an alias.
+  check("the human name reduces to the endpoint id", normaliseModelKey("DeepSeek V4.1 Flash") === normaliseModelKey("deepseek-v4.1-flash"), normaliseModelKey("DeepSeek V4.1 Flash"));
+  check("and so does the catalog's own id", normaliseModelKey("deepseek-flash") !== normaliseModelKey("deepseek-v4.1-flash"), "distinct, so the NAME index is what connects them");
+  check("a dated variant keeps its date", normaliseModelKey("deepseek-v4-flash-0731") !== normaliseModelKey("deepseek-v4-flash"), "distinct");
+
+  const eight = (v) => Array.from({ length: 8 }, (_, i) => ({ provider: "c" + i, entry: { id: "x", maxTokens: v }, matchedId: "deepseek/x", via: "id" }));
+  const majority = resolveByCorroboration([...eight(384000), { provider: "openrouter", entry: { id: "x", maxTokens: 943718 }, matchedId: "deepseek/x", via: "id" }], "maxTokens");
+  check("eight against one wins", majority.value === 384000, String(majority.value));
+  check("and it is recorded as a majority", majority.how === "majority", majority.how);
+
+  // A plurality is not corroboration: with no majority the vendor speaks first.
+  const split = [
+    { provider: "openrouter", entry: { id: "x", maxTokens: 999 }, matchedId: "z-ai/glm-5.3", via: "id" },
+    { provider: "zai", entry: { id: "x", maxTokens: 111 }, matchedId: "z-ai/glm-5.3", via: "id" },
+    { provider: "a", entry: { id: "x", maxTokens: 222 }, matchedId: "z-ai/glm-5.3", via: "id" },
+  ];
+  const noMajority = resolveByCorroboration(split, "maxTokens", "zai", "openrouter");
+  check("without a majority the vendor's catalog speaks", noMajority.value === 111, String(noMajority.value));
+  check("and it says so", noMajority.how === "vendor fallback", noMajority.how);
+  check("z-ai maps to the zai catalog", VENDOR_CATALOG_ALIASES["z-ai"] === "zai", String(VENDOR_CATALOG_ALIASES["z-ai"]));
+
+  // A level one catalog omits is a level another one still asserted.
+  const merged = resolveByCorroboration(
+    [
+      { provider: "openrouter", entry: { id: "x", thinkingLevelMap: { off: "none", low: "low", high: "high" } }, matchedId: "qwen/x", via: "id" },
+      { provider: "deepseek", entry: { id: "x", thinkingLevelMap: { low: "low", high: "high", max: "max" } }, matchedId: "qwen/x", via: "id" },
+      { provider: "c", entry: { id: "x", thinkingLevelMap: { low: "low", high: "high", max: "max" } }, matchedId: "qwen/x", via: "id" },
+    ],
+    "thinkingLevelMap",
+  );
+  check("a level the majority omits is not erased by it", merged.value.low === "low", JSON.stringify(merged.value));
+  check("a level only one states is still kept", merged.value.max === "max", JSON.stringify(merged.value));
+  check("and the level only one catalog states is kept, because silence is not a claim", merged.value.off === "none", JSON.stringify(merged.value));
+
+  // cost describes this endpoint, so it is reported as a spread and never
+  // published as a single number.
+  const range = estimateCostRange([
+    { provider: "openrouter", entry: { id: "x", cost: { input: 0.037, output: 0.17 } }, matchedId: "x", via: "id" },
+    { provider: "opencode", entry: { id: "x", cost: { input: 0.3, output: 1.2 } }, matchedId: "x", via: "id" },
+  ]);
+  check("the cost range spans the resellers", range.input.min === 0.037 && range.input.max === 0.3, JSON.stringify(range.input));
+  const published = resolveModel("deepseek-v4-pro", undefined, [cat("openrouter", { "deepseek-v4-pro": { id: "x", cost: { input: 1, output: 2 } } })], false);
+  check("cost is still never published from a catalog", published.entry.cost === undefined, JSON.stringify(published.entry.cost));
+}
+
+console.log("\nthe vendor's catalog is reachable by name, not only by id");
+{
+  const vendor = { provider: "deepseek", models: new Map([["deepseek-flash", { id: "deepseek-flash", name: "DeepSeek V4.1 Flash", maxTokens: 384000 }]]), modelsByName: new Map([["deepseekv41flash", { id: "deepseek-flash", name: "DeepSeek V4.1 Flash", maxTokens: 384000 }]]) };
+  const r = resolveModel("deepseek-v4.1-flash", undefined, [vendor], false);
+  check("an id alone would not have matched", vendor.models.has("deepseek-v4.1-flash") === false, "not in models");
+  check("the name index does match it", r.entry.maxTokens === 384000, String(r.entry.maxTokens));
+}
+
+console.log("\nthe vendor's own catalog decides, even against a majority");
+{
+  const { FAMILY_VENDOR, modelFamily, vendorCatalogProvider, resolveModel } = await load("donors-enclave.ts");
+
+  check("kimi belongs to moonshotai", FAMILY_VENDOR["kimi"] === "moonshotai", String(FAMILY_VENDOR["kimi"]));
+  check("claude belongs to anthropic", FAMILY_VENDOR["claude"] === "anthropic", String(FAMILY_VENDOR["claude"]));
+  check("a version bump does not move a model out of its family", modelFamily("qwen3.8-max") === "qwen", modelFamily("qwen3.8-max"));
+  check("nor does a family with a digit", modelFamily("glm-5.3") === "glm", modelFamily("glm-5.3"));
+
+  // Four resellers against the vendor. The vendor's number is the one that
+  // stands: it records what the model implements, the rest record what one
+  // gateway accepts.
+  const resellers = ["openrouter", "together", "vercel-ai-gateway", "baseten"].map((p) =>
+    cat(p, { "kimi-k3": { id: p + "/kimi-k3", maxTokens: 999999 } }),
+  );
+  const vendor = cat("moonshotai", { "kimi-k3": { id: "kimi-k3", maxTokens: 131072 } });
+  const r = resolveModel("kimi-k3", undefined, [vendor, ...resellers], false);
+  check("the vendor's figure wins", r.entry.maxTokens === 131072, String(r.entry.maxTokens));
+  check("and it is attributed to the vendor", r.source === "moonshotai", String(r.source));
+  check("the resellers are still recorded", r.corroborating.length === 4, r.corroborating.join(","));
+  check("the vendor is found from the family", vendorCatalogProvider([{ provider: "moonshotai", entry: {}, matchedId: "kimi-k3", via: "id" }], "kimi-k3") === "moonshotai", "moonshotai");
+
+  // With no vendor catalog, agreement decides instead.
+  const sinVendor = resolveModel("qwen3.8-max", undefined, [
+    cat("openrouter", { "qwen3.8-max": { id: "qwen/qwen3.8-max", maxTokens: 1 } }),
+    cat("opencode", { "qwen3.8-max": { id: "qwen3.8-max", maxTokens: 2 } }),
+    cat("together", { "qwen3.8-max": { id: "qwen3.8-max", maxTokens: 2 } }),
+  ], false);
+  check("without a vendor the majority stands", sinVendor.entry.maxTokens === 2, String(sinVendor.entry.maxTokens));
+  check("and it is not attributed to a vendor", sinVendor.source !== "moonshotai", String(sinVendor.source));
+}
+
+console.log("\na ceiling that cannot exist is not a claim");
+{
+  const { isPossibleValue, normaliseModelKey } = await load("donors-enclave.ts");
+  check("a ceiling below the window is possible", isPossibleValue({ maxTokens: 384000, contextWindow: 1048576 }, "maxTokens") === true, "384000 < 1048576");
+  check("a ceiling equal to the window is not", isPossibleValue({ maxTokens: 1048576, contextWindow: 1048576 }, "maxTokens") === false, "equal");
+  check("nor one above it", isPossibleValue({ maxTokens: 2000000, contextWindow: 1048576 }, "maxTokens") === false, "above");
+  check("a figure with no window beside it is taken at face value", isPossibleValue({ maxTokens: 1048576 }, "maxTokens") === true, "no window");
+  check("other fields are never discarded this way", isPossibleValue({ input: ["text", "image"], contextWindow: 1 }, "input") === true, "input");
+
+  // The vendor states an impossible ceiling, so the field falls through.
+  const r = resolveModel("kimi-k3", undefined, [
+    cat("moonshotai", { "kimi-k3": { id: "kimi-k3", maxTokens: 1048576, contextWindow: 1048576 } }),
+    cat("openrouter", { "kimi-k3": { id: "moonshotai/kimi-k3", maxTokens: 131072, contextWindow: 1048576 } }),
+    cat("opencode", { "kimi-k3": { id: "kimi-k3", maxTokens: 131072, contextWindow: 1048576 } }),
+    cat("opencode-go", { "kimi-k3": { id: "kimi-k3", maxTokens: 131072, contextWindow: 1048576 } }),
+  ], false);
+  check("the impossible figure is not published", r.entry.maxTokens === 131072, String(r.entry.maxTokens));
+  check("and the vendor is still named as the source", r.source === "moonshotai", String(r.source));
+
+  // A vendor figure that could exist is published untouched.
+  const vendorCatalog = (provider, id, name, extra) => {
+    const entry = Object.assign({ id, name }, extra);
+    return {
+      provider,
+      models: new Map([[id, entry]]),
+      modelsByName: new Map([[normaliseModelKey(name), entry]]),
+    };
+  };
+  const ok = resolveModel("deepseek-v4.1-flash", undefined, [
+    vendorCatalog("deepseek", "deepseek-flash", "DeepSeek V4.1 Flash", { maxTokens: 384000, contextWindow: 1000000 }),
+    cat("openrouter", { "deepseek-v4.1-flash": { id: "deepseek/deepseek-v4.1-flash", maxTokens: 943718, contextWindow: 1048576 } }),
+  ], false);
+  check("a possible vendor figure wins against openrouter", ok.entry.maxTokens === 384000, String(ok.entry.maxTokens));
 }
 
 console.log(`\n${passed} passed, ${failed.length} failed`);
