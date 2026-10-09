@@ -3,10 +3,18 @@
 [![Version: 0.1.10](https://img.shields.io/badge/version-0.1.10-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-EnClave provider for [Pi](https://pi.dev). The live router catalog shows up in
-`/model` with **real context windows, real per-token prices, live membership and
-the router's task aliases** — resolved from the model catalog Pi already ships,
-with no extra account required.
+EnClave provider for [Pi](https://pi.dev).
+
+Pi is a coding assistant that talks to AI models. EnClave is a gateway: one
+address that reaches many models from many companies. The problem is that
+EnClave tells Pi very little about each model — how much text it can read, how
+much it can write back, whether it understands images, which "thinking effort"
+settings it accepts. Without those numbers, Pi has to guess.
+
+This package supplies them. When you run `/model` you see each model with its
+real context window, its real price per million tokens, whether your key can
+actually reach it, and the router's task aliases. Every number is read from a
+catalog Pi already has on disk, so no extra account is needed.
 
 <a href="https://github.com/Gentleman-Programming/gentle-ai">
   <img width="220" src="https://raw.githubusercontent.com/Gentleman-Programming/gentle-ai/main/docs/assets/brand/built-with-gentle-ai.png" alt="Built with Gentle-AI" />
@@ -271,8 +279,9 @@ Then log in once:
 /login EnClave
 ```
 
-The catalog builds itself. `/model` shows every model the router serves for your
-key, with the values resolved and each one attributed to where it came from.
+That is all. The model list builds itself, and `/model` shows every model the
+router serves for your key. Each one carries a note saying where its numbers came
+from, so you can check them instead of trusting them.
 
 > **First check how the older copy was installed.** Pi can load an extension as
 > an installed package, or directly from a `.ts` file in `~/.pi/agent/extensions/`.
@@ -300,143 +309,201 @@ key, with the values resolved and each one attributed to where it came from.
 
 ## Why this package exists
 
-EnClave's router (`https://router.enclave.ai/v1`) is an OpenAI-compatible
-gateway, and its `/models` endpoint is unusually honest: it declares the context
-window, the price per million tokens, and whether *your* key has a healthy route
-to each model.
+EnClave's router lives at `https://router.enclave.ai/v1`. It speaks the same
+language as OpenAI's API, so any tool built for OpenAI can talk to it. Its
+`/models` address is unusually helpful: for each model it reports the context
+window, the price per million tokens, and whether *your* key has a working route
+to it.
 
-It is still silent on the things a coding agent actually needs to make decisions:
-which reasoning-effort values the model implements, whether it takes images, and
-how much output it will really produce. Left alone, a config file fills those
-with round placeholder numbers that look exactly like facts.
+But three things it never mentions matter just as much to a coding assistant:
 
-This package resolves them, and never invents one.
+- **Which thinking-effort values the model really accepts.** "Think harder" is a
+  real setting, and models disagree about which values they honour.
+- **Whether it can read images.**
+- **How much output it will actually produce.**
+
+When a tool is not told these, it fills them with round, plausible-looking
+defaults — numbers that look like facts but were never measured. This package
+finds them in Pi's own catalog and reports them. When no source states a value,
+it leaves the value alone rather than inventing one.
 
 ## ⚙️ How it works
 
-The rules are applied per field, in this order:
+Every model needs values for the same handful of fields. Where each value comes
+from follows one priority order, decided **field by field** — not model by model,
+and not averaged:
 
 ```text
-hand-written vendor card (VENDOR_SPEC)
-  > the catalog belonging to the model's official vendor
-  > simple majority among catalogs that state the field (only when there is no vendor catalog)
-  > OpenRouter fallback (when there is no vendor catalog or majority)
-  > values already kept in models.json, when no catalog states the field
+1. a hand-written vendor card (VENDOR_SPEC)
+2. the catalog belonging to the model's own vendor
+3. a simple majority among catalogs that state the field   (only if step 2 is absent)
+4. OpenRouter                                              (only if step 3 has no majority)
+5. whatever models.json already says                       (only if no catalog states the field)
 ```
 
-**The official vendor catalog is authoritative for the values it actually
-states.** A reseller's catalog describes what one gateway accepts; the vendor's
-catalog describes the model itself. The vendor is mapped by model family because
-resellers stamp their own provider name on models they resell. If there is no
-first-party catalog in Pi, the value most catalogs agree on wins. A simple
-majority is required; a plurality falls back to OpenRouter. Nothing is averaged.
+**Why the vendor comes first.** Many of the catalogs Pi ships belong to
+*resellers* — companies that host other companies' models. A reseller's catalog
+describes what one gateway happens to accept. The vendor's own catalog describes
+the model itself. When they disagree, the vendor is describing the thing; the
+reseller is describing one doorway to it.
 
-**Thinking levels follow the same rule one key at a time.** An explicit vendor
-value — including `null` — decides that level. If the vendor omits a level, that
-is silence, and corroboration decides only that key. This lets a partial official
-map coexist with values other catalogs state, without allowing a reseller to
-replace levels the vendor did declare.
+A concrete case: for `deepseek-v4.1-flash`, eight catalogs state an output ceiling
+of 384,000 tokens — DeepSeek's own first among them — while OpenRouter alone says
+943,718. The old rule published OpenRouter's figure, and this gateway rejected it.
+The vendor's number is now the one published.
 
-A ceiling equal to or above its catalog's own context window is treated as an
-impossible claim and falls through. `contextWindow` belongs to the endpoint and is never overwritten by a donor.
-`cost` is not published from a bundled catalog: prices belong to resellers, so
-combining them would make up a price EnClave may not charge. The donor module
-exposes a min/max cost range for inspection only.
+**How the vendor is found.** By the model's family name: `kimi` belongs to
+Moonshot, `claude` to Anthropic, `gpt` to OpenAI, `glm` to zai, `deepseek` to
+DeepSeek, `mimo` to Xiaomi, `nemotron` to NVIDIA. This cannot be worked out from
+the files, because every catalog stamps its own name as the provider — including a
+reseller stamping its name on a model it did not make. So the list is written down
+explicitly, one line per family, exactly like the dated-model aliases.
 
-**No credential is needed to read a catalog.** The files live in Pi's own package
-(`pi-ai/dist/providers/data/`). A key is only needed to *call* an API, not to
-read what Pi already installed — so a fresh Pi with no accounts anywhere still
-gets the full catalog.
+**When there is no vendor catalog**, the catalogs vote. A value needs a *simple
+majority* of those that state the field at all: three votes out of ten is not
+agreement, it is a split, and a split falls back to OpenRouter. Nothing is ever
+averaged — an average of two real numbers is a third number that nobody published.
+
+**Thinking levels are decided one level at a time.** A model's
+`thinkingLevelMap` says which effort levels work. It is not one value but seven
+independent ones (`off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`). If
+the vendor states a level — even to say "not supported" with an explicit `null` —
+that answer stands. If the vendor simply does not mention a level, that silence
+says nothing, and only that single level is decided by the other catalogs. Two
+consequences worth knowing:
+
+- A reseller listing only two levels cannot erase the five its vendor declared.
+- A vendor listing only one level does not block the others from being filled in.
+
+**A ceiling as large as the window is treated as impossible, not generous.** Some
+catalogs write the row that way: Moonshot lists `kimi-k3` with a context window of
+1,048,576 and an output ceiling of 1,048,576 — the same number twice. But a prompt
+must fit in the window alongside the output, so a ceiling that fills the whole
+window cannot be served. That figure is treated as no answer at all, and the field
+falls through to the catalogs that state a ceiling a model can keep.
+
+**Two fields are never taken from a catalog at all.**
+
+| Field | Why it belongs to EnClave |
+|---|---|
+| `contextWindow` | It describes what *this* gateway serves, not what the model can do. |
+| `cost` | A price belongs to whoever charges it. Combining prices from several resellers would produce a number EnClave may never charge. |
+
+The donor module can report an approximate minimum-to-maximum cost range when
+asked directly, for inspection only. It is not published as a price.
+
+**No account is needed to read these catalogs.** They are plain JSON files that
+ship inside Pi itself, under `pi-ai/dist/providers/data/`. An API key is needed to
+*call* a model; reading what Pi already installed on your disk needs nothing. A
+brand-new Pi with no logins at all still gets the full catalog.
 
 ### 🔎 Two refresh phases
 
-Pi drives the refresh; the extension never invents a value in it.
+The list is built in two separate steps, and worth understanding because they do
+different jobs.
 
-| Phase | When | What it does |
+| Phase | When it runs | What it does |
 |---|---|---|
-| **Cache-only restore** | Every runtime creation | Rebuilds the catalog from `models.json` plus the store. Instant, works offline. |
-| **Live membership** | Interactive startup, `/model` search | Fetches `/models` and adds ids the endpoint started serving, drops ids it stopped. |
+| **Restore from cache** | Every time Pi starts the provider | Rebuilds the list from `models.json` plus Pi's saved state. Instant, and works with no network. |
+| **Refresh membership** | Interactive startup, and when you search in `/model` | Asks the endpoint which models exist right now, adds any that appeared, and drops any that disappeared. |
 
-Live membership only ever changes *who* is in the list. The values come from
-`models.json`, which `scripts/sync-models.mjs` owns.
+The second step only ever changes *who is on the list*, never what their numbers
+are. The numbers come from `models.json`, which `scripts/sync-models.mjs` is the
+only writer of.
 
-Kill switch: `PI_ENCLAVE_LIVE=0` freezes the catalog.
+One environment variable controls this: setting `PI_ENCLAVE_LIVE=0` freezes the
+list, which is useful when you want to test without the network changing things
+underneath you.
 
 ### 🏷️ Which models get published
 
-A model appears only if the router lists it, `routeable_endpoint_count > 0`, and
-it answers a request.
+A model is published only if all three of these hold: the router lists it, your
+key has a working route to it, and it actually answers a request.
 
-Three ways a listed model can still be unusable, and all three are handled:
+Listing is not enough, and there are three separate ways a listed model can turn
+out to be unusable. Each is handled:
 
-| Signal | What it means |
+| What you see | What is really happening |
 |---|---|
-| listed, `routeable_endpoint_count: 0` | Your key has no healthy route. Every request 404s. |
-| answers `502 "provider returned HTTP 410"` | The catalog calls it healthy; the inference provider behind it is gone. `410 Gone` is permanent, not a blip. |
-| simply absent from `/models` | Retired upstream. |
+| Listed, but `routeable_endpoint_count: 0` — the check is `routeable_endpoint_count > 0` | You have no working route. Every request returns `404`. |
+| Answers `502 "provider returned HTTP 410"` | The catalog calls it healthy, but the provider behind it is gone. `410 Gone` means permanently, not "try again later". |
+| Simply absent from `/models` | Retired upstream. |
 
-The third one had a real effect: `cyberouter/remediation` is a router alias that
-routes by task score, and it was failing because the top-scoring remediation
-model was one of the dead ones.
+The third case caused a real failure worth naming: `cyberouter/remediation` is a
+router alias that picks a model by task quality score. It kept failing because the
+highest-scoring remediation model was one of the dead ones.
 
 ### 🔀 Router aliases
 
-`cyberouter/auto` plus one per security task (`vuln-discovery`, `exploit-dev`,
-`remediation`, `triage`) are usable as a model and are published.
+Five entries are not ordinary models. `cyberouter/auto` and one alias per security
+task (`vuln-discovery`, `exploit-dev`, `remediation`, `triage`) are *instructions*:
+you pick one and the router decides which concrete model to use, per request. They
+behave like models, so they are published like models.
 
-The endpoint lists them twice: once inside `data` and once in a sibling field of
-the catalog. Both are read, and each alias is published **once** — from the `data`
-entry, which carries the endpoint's own window and name. A parser that reads only
-one of the two either loses all five (sibling only) or publishes each of them
-twice with different values (`data` only).
+They are also the reason a naive parser breaks. The endpoint lists each of them
+**twice** — once inside `data` and once in a sibling field of the catalog. Code
+that reads only the sibling field loses all five. Code that reads only `data`
+publishes each of them twice, with different windows, names and prices. This
+package reads both and publishes each exactly once, taking the `data` entry
+because it carries the endpoint's own window and name.
 
-Their price depends on which concrete model the router picks per request, so it is
-bounded rather than guessed: at the catalog ceiling. When the endpoint states no
-window either, the context falls back to the catalog floor.
+Their price cannot be known in advance, because the router picks the model later.
+Rather than guess, the answer is bounded: priced at the catalog ceiling. If the
+endpoint states no window either, the context falls back to the catalog's floor
+value.
 
-They are deliberately **never** resolved from a catalog. OpenRouter has a model
-called `auto` too, advertising a 2,000,000 window — a different thing that shares
-the name, and a lie here.
+One thing is deliberately refused. These aliases are **never** looked up in a
+catalog. OpenRouter also has a model called `auto`, advertising a 2,000,000-token
+window. It is a different thing that happens to share a name, and using its numbers
+here would be a lie.
 
 ## 🐞 Fixes
 
-**A ceiling that the window cannot hold is impossible, not large.** OpenRouter
-listed `inkling` at 471,859 against a 262,144 window here, and the endpoint
-refused it with *"This request needs about N tokens (messages + tools +
-max_tokens)"*. Clamped to the window minus a prompt reserve.
+These are real problems that were found by using the thing, not by reading it.
 
-**The reserve has to survive a real conversation.** 2,048 tokens covered a toy
-request. This router counts `messages + tools + max_tokens` against the window,
-not the output alone, and a real Pi call carries the system prompt plus every
-tool schema — order 20k tokens. `gpt-oss-120b` had 13,108 tokens of input room
-and **every** call returned `400` as soon as the conversation carried anything.
+**A ceiling bigger than the window is not generous, it is impossible.**
+OpenRouter listed `inkling` with a 471,859-token ceiling against a 262,144-token
+window here, and the endpoint refused every request with *"This request needs
+about N tokens (messages + tools + max_tokens)"*. Fixed by clamping the ceiling to
+the window minus a reserve for the prompt.
 
-**`maxTokens` must never be `null`.** Pi's model list calls `.toString()` on it
-and crashes with *"Cannot read properties of undefined"*, taking the whole list
-with it.
+**The reserve has to survive a real conversation, not a test one.** The first
+version held back 2,048 tokens, which is fine for the word "hi" and useless in
+practice. The router counts `messages + tools + max_tokens` together against the
+window, and a real Pi request carries the system prompt plus every tool's schema —
+on the order of 20,000 tokens. `gpt-oss-120b` was publishing a 117,964-token
+ceiling inside a 131,072-token window, leaving about 13,000 tokens for input.
+Every call failed with `400` as soon as the conversation had anything in it.
 
-**`compat` is never inherited from a catalog.** OpenRouter ships
-`thinkingFormat: "openrouter"` plus seven other flags describing how *it* wants
-reasoning framed. This endpoint speaks the OpenAI shape — verified by sending
-`reasoning_effort` and watching what came back. Copying those flags would change
-the request format on an endpoint they were never tested against.
+**`maxTokens` must never be `null`.** Pi's model list calls `.toString()` on it,
+crashes with *"Cannot read properties of undefined"*, and takes the entire list
+down with it.
 
-**An accepted value is not an implemented one.** The endpoint accepts all six
-effort levels for `glm-5.3`; the vendor card says the model only implements
-low, high and max. The extras are accepted and then ignored, which is worse than
-not offering them: Pi would show a thinking level that silently does nothing.
+**`compat` is never copied from a catalog.** OpenRouter ships a field called
+`thinkingFormat: "openrouter"` plus seven other flags describing how *OpenRouter*
+wants reasoning requests framed. This gateway speaks the plain OpenAI shape,
+verified by sending `reasoning_effort` and watching what came back. Copying those
+flags would silently change the request format on a gateway where nobody tested
+them.
 
-**Catalog claims are resolved per field, and thinking maps per key.** An
-explicit vendor value — including `null` — is authoritative. If the vendor omits
-a thinking level, that omission is silence; only that level falls through to
-the other catalogs and their majority rule. A reseller's partial map cannot
-replace levels the vendor declared, and a partial vendor map can be completed
-from corroboration.
+**Accepting a value is not the same as implementing it.** For `glm-5.3`, the
+gateway accepts all six effort levels. The vendor's own card says the model only
+implements three of them. The extra three are accepted and then quietly ignored —
+which is worse than refusing them, because Pi would offer you a thinking level
+that does nothing at all.
 
-**A scoped package publishes private by default.** `npm publish` failed with
-`E402 "You must sign up for private packages"`, which reads like a billing
-problem and is not one: restricted packages need a paid plan. Declared in the
-manifest as `"publishConfig": { "access": "public" }`.
+**A claim and a silence are different things, and this applies per level.** If a
+vendor states a thinking level — even `null`, meaning "not supported" — that
+answer is final. If the vendor does not mention the level, that is silence:
+another catalog's answer is used for that single level. So a reseller's short
+list cannot delete levels the vendor declared, and a vendor's short list does not
+block the missing ones from being filled in.
+
+**A scoped package publishes as private by default.** `npm publish` failed with
+`E402 "You must sign up for private packages"`, which sounds like a billing
+problem and is not one: private packages need a paid plan. Fixed by declaring
+`"publishConfig": { "access": "public" }` in the manifest, so a plain `npm
+publish` does the right thing.
 
 ## 🔑 Authentication
 
@@ -444,13 +511,15 @@ manifest as `"publishConfig": { "access": "public" }`.
 /login EnClave
 ```
 
-The key lives in `~/.pi/agent/auth.json`, managed by Pi. The catalog needs no key;
-only live membership and the liveness check do.
+Your key is stored by Pi in `~/.pi/agent/auth.json`; you never edit it by hand.
+The catalog itself needs no key — only the two network steps do: checking which
+models your key can reach, and confirming they still answer.
 
 ## 📊 Models
 
-Values are resolved per model and written to `providers.EnClave.models` in
-`models.json`. Each one records exactly where it came from:
+Each model's values are worked out and written to `providers.EnClave.models` in
+`models.json`. Every entry also records where its numbers came from, so you can
+audit them rather than trust them:
 
 ```json
 "donor": {
@@ -461,9 +530,10 @@ Values are resolved per model and written to `providers.EnClave.models` in
 }
 ```
 
-`matchedId` is the **full id with its prefix**, not the short name, so a match can
-be audited without guessing — including when it resolved through a dated vendor
-slug.
+`matchedId` is the **complete id, prefix included** — not the shortened name. That
+matters because the same model carries different prefixes in different catalogs.
+Keeping the full id means you can see exactly which entry was used, including
+when it was found through a dated variant.
 
 ### What a donor may not set
 
@@ -475,30 +545,33 @@ slug.
 
 ### The ceiling clamp
 
-An output ceiling larger than the context can hold is not a bigger claim, it is an
-impossible one — a request cannot ask for more output than the window contains,
-and the endpoint says so:
+An output ceiling larger than the context window is not an ambitious claim, it is
+an impossible one: a request cannot ask for more room than the window contains.
+The endpoint says so plainly:
 
 > This request needs about N tokens (messages + tools + max_tokens)
 
-A donor value is therefore clamped to the window minus a 2,048-token prompt
-reserve. It cannot equal the window either: measured, 262,144 was rejected while
-261,120 passed.
+So a catalog value is clamped to the window minus a reserve for the prompt. It
+cannot be *equal* to the window either — measured directly, 262,144 was rejected
+while 261,120 passed.
 
-A value inside the limit is used exactly as given. The clamp removes
-impossibilities; it does not second-guess the catalog.
+A value that already fits is used exactly as given. The clamp only removes
+impossibilities; it never second-guesses a catalog that stayed inside the limit.
 
-In practice the published value is a **ceiling, not a fixed request**. Pi reduces
-it per turn to `min(published, contextWindow − prompt − 4096)`.
+It helps to know what the published number actually means: it is a **ceiling, not
+a fixed request size**. On every turn, Pi lowers it to
+`min(published, contextWindow − prompt − 4096)`.
 
 ## 🧠 Reasoning controls
 
-Each model gets a `thinkingLevelMap`. A level mapped to `null` is not offered, so
-Pi snaps to the nearest supported level instead of sending a value the gateway
-refuses. `off: null` means thinking cannot be switched off and the option is
-hidden entirely.
+Every model gets a `thinkingLevelMap`, which says which thinking-effort levels it
+really accepts. Think of it as a row of switches. A level set to `null` is a
+switch that is simply not offered, so Pi picks the closest supported level instead
+of sending one the gateway will reject. When `off: null` is set, thinking cannot
+be turned off at all, and Pi hides that option completely.
 
-Two models carry a vendor card that narrows what the catalog claims:
+Two models carry a hand-written vendor card that overrides what the catalogs claim,
+because the catalogs are more optimistic than the models actually are:
 
 | Model | Card says | Catalog claims |
 |---|---|---|
@@ -587,18 +660,22 @@ because the date is in the name too, and `glm-5.3` never reaches `glm-5.3-flash`
 
 ### Maintaining the curated values
 
-Report-only. It never writes without you asking, and the diff is the deliverable.
+This script is the only thing that writes to `models.json`. Run it without
+arguments and it reports only — it shows what it would change and stops. Adding
+`--dry-run` makes that explicit:
 
 ```bash
 node --experimental-strip-types scripts/sync-models.mjs --dry-run
 node --experimental-strip-types scripts/sync-models.mjs
 ```
 
-It reports which donor supplied each value, who corroborated it, what is still
-missing, and what it excluded. Then it writes `models.json` and leaves a backup.
+Its report answers four questions: which source supplied each value, which other
+catalogs agreed, what is still unknown, and what it deliberately excluded. When
+you run it for real, it writes `models.json` and leaves a backup beside it.
 
-To add a vendor correction, add it to `VENDOR_SPEC` in `donors-enclave.ts` with the reason
-it exists, so a later reader can check it against the model card.
+To record a correction from a vendor's documentation, add it to `VENDOR_SPEC` in
+`donors-enclave.ts` — and write down the reason in the same entry, so the next
+person can check it against the model card instead of taking it on faith.
 
 ### Tests
 
@@ -606,11 +683,13 @@ it exists, so a later reader can check it against the model card.
 node --experimental-strip-types scripts/test-sync.mjs
 ```
 
-107 offline checks: bare-id and normalized-name matching, dated near misses,
-model-card and vendor-family authority, per-key reasoning maps (including
-partial official maps and explicit nulls), majority fallback, alias exclusion,
-free-model exclusion, impossible ceiling rejection, router-alias handling, and
-simulated catalog layouts.
+107 checks that run offline, with no network and no API key. They cover: matching
+a model by its id and by its written name, near misses that must *not* match
+(dated variants), authority of the model card and the vendor's family, reasoning
+maps resolved level by level including partial vendor maps and explicit `null`
+values, majority fallback, exclusion of router aliases, exclusion of `free`
+models, rejection of impossible ceilings, handling of router aliases, and the
+different folder layouts Pi can be installed into.
 
 ## License
 
