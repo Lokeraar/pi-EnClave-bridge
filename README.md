@@ -1,6 +1,6 @@
 # @lokeraar/pi-enclave-bridge
 
-[![Version: 0.1.10](https://img.shields.io/badge/version-0.1.10-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
+[![Version: 0.2.0](https://img.shields.io/badge/version-0.2.0-blue.svg)](https://www.npmjs.com/package/@lokeraar/pi-enclave-bridge)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 EnClave provider for [Pi](https://pi.dev).
@@ -45,7 +45,7 @@ testing something specific, or a fix has not been published yet — during that
 window this is the only way to get it. To pin a release:
 
 ```bash
-pi install git:github.com/Lokeraar/pi-EnClave-bridge#v0.1.10
+pi install git:github.com/Lokeraar/pi-EnClave-bridge#v0.2.0
 ```
 
 
@@ -54,6 +54,15 @@ pi install git:github.com/Lokeraar/pi-EnClave-bridge#v0.1.10
 > Every star is read by a human, and so is every bug report.
 
 ## 📋 Releases
+
+### 0.2.0 — free automatic refresh, explicit paid liveness
+
+The automatic provider refresh checks membership with exactly one `GET /models`
+request. It performs no inference and makes no paid `/chat/completions` request.
+Liveness probes are reserved for `scripts/sync-models.mjs`, an explicit
+maintenance operation. Added `scripts/test-refresh.mjs` as regression coverage
+for the GET-only refresh, publication, alias deduplication, cache-only restore,
+and the no-credential path.
 
 ### 0.1.10 — vendor reasoning levels resolve key by key
 
